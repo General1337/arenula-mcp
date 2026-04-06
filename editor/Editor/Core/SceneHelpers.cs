@@ -40,7 +40,7 @@ internal static class SceneHelpers
 
     internal const string IgnoreMarker = "(MCP IGNORE)";
     internal const string IgnoreTag = "mcp_ignore";
-    internal const int MaxAutoWalkChildren = 25;
+    internal const int MaxAutoWalkChildren = 500;
 
     internal static IEnumerable<GameObject> WalkAll( Scene scene, bool includeDisabled = true )
     {
