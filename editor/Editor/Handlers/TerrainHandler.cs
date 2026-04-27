@@ -813,9 +813,15 @@ internal static class TerrainHandler
             var res = storage.Resolution;
             var terrainHeight = terrain.TerrainHeight;
 
-            // Resize if image doesn't match terrain resolution
+            // 2026-04-21 — Resize allocates a new Bitmap; dispose the original
+            // before overwriting the reference to avoid leaking the pre-resize
+            // buffer (Bitmap is IDisposable).
             if ( bitmap.Width != res || bitmap.Height != res )
-                bitmap = bitmap.Resize( res, res );
+            {
+                var resized = bitmap.Resize( res, res );
+                bitmap.Dispose();
+                bitmap = resized;
+            }
 
             var pixels = bitmap.GetPixels();
             for ( int i = 0; i < Math.Min( pixels.Length, storage.HeightMap.Length ); i++ )
@@ -873,7 +879,14 @@ internal static class TerrainHandler
             var pngData = bitmap.ToPng();
             bitmap.Dispose();
 
-            var absPath = HandlerBase.ResolveProjectPath( path ) ?? path;
+            // 2026-04-21 — must resolve through project root; do NOT fall back
+            // to raw `path` (which would allow an external RPC client to write
+            // via absolute or `..`-containing paths to arbitrary locations on
+            // the user's disk).
+            var absPath = HandlerBase.ResolveProjectPath( path );
+            if ( string.IsNullOrEmpty( absPath ) )
+                return HandlerBase.Error( $"Path '{path}' could not be resolved inside the project root.", "export_heightmap",
+                    "Use a project-relative path like 'heightmaps/terrain_export.png'." );
             var dir = System.IO.Path.GetDirectoryName( absPath );
             if ( !string.IsNullOrEmpty( dir ) && !System.IO.Directory.Exists( dir ) )
                 System.IO.Directory.CreateDirectory( dir );
@@ -1200,7 +1213,12 @@ internal static class TerrainHandler
         // Convert to texel coordinates
         var texelX = (int)(localX * res);
         var texelY = (int)(localY * res);
-        var texelRadius = (int)(radius / terrainSize * res);
+        // 2026-04-21 — Math.Max(1, ...) mirrors BlendMaterials; without it,
+        // small radii silently round to 0 and the brush loop never executes.
+        var texelRadius = Math.Max( 1, (int)(radius / terrainSize * res) );
+
+        if ( materialIndex > 31 )
+            return HandlerBase.Error( $"Material index {materialIndex} exceeds 5-bit encoding (max 31).", "paint_material" );
 
         var painted = 0;
         for ( int dy = -texelRadius; dy <= texelRadius; dy++ )
@@ -1217,9 +1235,15 @@ internal static class TerrainHandler
                 var idx = py * res + px;
                 if ( idx >= 0 && idx < storage.ControlMap.Length )
                 {
-                    // Set the material index in the control map
-                    // Control map encoding: base material in lower bits
-                    storage.ControlMap[idx] = (uint)materialIndex;
+                    // 2026-04-21 — control map is a packed uint (bits 0-4 = base
+                    // material, 5-9 = overlay, 10-17 = blend, 31 = hole flag).
+                    // Solid-paint semantics: set base, clear overlay+blend,
+                    // preserve hole bit. Prior impl wrote raw `materialIndex`
+                    // and silently wiped the hole flag — breaking carved
+                    // terrain every time a user painted over a hole texel.
+                    uint packed = ( (uint)materialIndex & 0x1Fu )
+                                | ( storage.ControlMap[idx] & 0x80000000u );
+                    storage.ControlMap[idx] = packed;
                     painted++;
                 }
             }

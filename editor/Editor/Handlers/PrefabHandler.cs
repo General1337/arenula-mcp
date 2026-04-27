@@ -252,8 +252,14 @@ internal static class PrefabHandler
             };
             System.IO.File.WriteAllText( absPath, prefabJson.ToJsonString() );
 
-            // Register the new file with the asset system
-            AssetSystem.RegisterFile( absPath );
+            // 2026-04-21 — do NOT call AssetSystem.RegisterFile(absPath).
+            // See AssetManageHandler.Create for rationale — eager registration
+            // contributes to stale entries in the Facepunch asset cache (no
+            // UnregisterFile exists) and fuels the per-frame
+            // 'Editor.LocalAssetLocations tool.frame' error spam.
+            // Engine rescan picks up the prefab; MCP clients that need to
+            // instantiate immediately can call prefab.instantiate which has
+            // its own fallback path for not-yet-indexed files.
 
             return HandlerBase.Success( new
             {

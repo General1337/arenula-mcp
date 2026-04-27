@@ -80,8 +80,13 @@ internal static class AssetManageHandler
 
             System.IO.File.WriteAllText( absPath, content );
 
-            // Immediately register the new file with the asset system
-            AssetSystem.RegisterFile( absPath );
+            // 2026-04-21 — do NOT call AssetSystem.RegisterFile here.
+            // Engine rescan picks up the new file; eager registration can leave
+            // stale entries in the Facepunch asset cache (no UnregisterFile API
+            // exists) which manifest as per-frame errors on the editor-internal
+            // 'Editor.LocalAssetLocations tool.frame' handler.
+            // MCP clients that need an immediate asset handle should call
+            // asset_manage.reload after create.
 
             return HandlerBase.Success( new
             {
@@ -171,8 +176,12 @@ internal static class AssetManageHandler
             var newAbsPath = System.IO.Path.Combine( dir, newName );
             System.IO.File.Move( absPath, newAbsPath );
 
-            // Re-register the moved file with the asset system
-            AssetSystem.RegisterFile( newAbsPath );
+            // 2026-04-21 — do NOT call AssetSystem.RegisterFile(newAbsPath).
+            // Rename leaves the OLD path in the engine's asset cache (no
+            // UnregisterFile API exists). Registering the new path on top of
+            // that injects a second stale entry. The 'Editor.LocalAssetLocations
+            // tool.frame' spam in the editor console was traced to this pattern.
+            // Engine rescan picks up the new file and retires the old entry.
 
             // Compute new relative path
             var parentDir = System.IO.Path.GetDirectoryName( path );
@@ -232,8 +241,11 @@ internal static class AssetManageHandler
             var destAbsPath = System.IO.Path.Combine( destAbsDir, fileName );
             System.IO.File.Move( absPath, destAbsPath );
 
-            // Re-register the moved file with the asset system
-            AssetSystem.RegisterFile( destAbsPath );
+            // 2026-04-21 — do NOT call AssetSystem.RegisterFile(destAbsPath).
+            // See Rename handler for rationale: registering after File.Move
+            // leaves the old path in the engine's asset cache and injects a
+            // fresh entry, producing 'Editor.LocalAssetLocations tool.frame'
+            // per-frame errors. Engine rescan handles the transition.
 
             var newRelPath = destination.TrimEnd( '/' ) + "/" + fileName;
 

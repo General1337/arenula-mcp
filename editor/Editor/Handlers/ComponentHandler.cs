@@ -26,8 +26,10 @@ internal static class ComponentHandler
                 "get_properties" => GetProperties( args ),
                 "get_types"      => GetTypes( args ),
                 "copy"           => Copy( args ),
+                "bulk_set"       => BulkSet( args, "bulk_set" ),
+                "apply_properties" => BulkSet( args, "apply_properties" ),
                 _ => HandlerBase.Error( $"Unknown action '{action}' for tool 'component'.", action,
-                    "Valid actions: add, remove, set_property, set_enabled, get_properties, get_types, copy" )
+                    "Valid actions: add, remove, set_property, set_enabled, get_properties, get_types, copy, bulk_set, apply_properties" )
             };
         }
         catch ( Exception ex )
@@ -73,7 +75,7 @@ internal static class ComponentHandler
     /// Prefers game-assembly types over Sandbox built-ins when names collide.
     /// Ported from OzmiumWriteHandlers.FindComponentTypeDescription.
     /// </summary>
-    private static TypeDescription FindComponentTypeDescription( string typeName )
+    internal static TypeDescription FindComponentTypeDescription( string typeName )
     {
         TypeDescription fallback = null;
         foreach ( var candidate in TypeLibrary.GetTypes<Component>() )
@@ -141,8 +143,10 @@ internal static class ComponentHandler
         {
             id = go.Id.ToString(),
             name = go.Name,
+            handle = SceneHelpers.BuildHandle( go ),
             component_id = comp.Id.ToString(),
             component_type = comp.GetType().Name,
+            component_handle = SceneHelpers.BuildHandle( comp ),
             message = $"Added '{td.Name}' to '{go.Name}'."
         } );
     }
@@ -213,9 +217,12 @@ internal static class ComponentHandler
         {
             id = go.Id.ToString(),
             name = go.Name,
+            handle = SceneHelpers.BuildHandle( go ),
             component_type = comp.GetType().Name,
+            component_handle = SceneHelpers.BuildHandle( comp ),
             property = propName,
-            value = readback?.ToString(),
+            value = SchemaHelpers.FormatValue( readback ),
+            value_schema = SchemaHelpers.DescribeType( prop.PropertyType ),
             message = $"Set '{comp.GetType().Name}.{propName}' = {readback}"
         } );
     }
@@ -225,7 +232,7 @@ internal static class ComponentHandler
     /// Supports: string, bool, int, float, double, Vector3, Enum, Model, Component, GameObject.
     /// Ported from OzmiumWriteHandlers.ConvertJsonValue.
     /// </summary>
-    private static object ConvertJsonValue( JsonElement el, Type targetType )
+    internal static object ConvertJsonValue( JsonElement el, Type targetType )
     {
         if ( targetType == typeof( string ) )
             return el.ValueKind == JsonValueKind.String ? el.GetString() : el.GetRawText();
@@ -273,10 +280,57 @@ internal static class ComponentHandler
             }
         }
 
-        if ( targetType == typeof( Color ) )
+        if ( targetType == typeof( Rotation ) )
         {
-            var str = el.ValueKind == JsonValueKind.String ? el.GetString() : el.GetRawText();
-            return Color.Parse( str ) ?? default;
+            if ( el.ValueKind == JsonValueKind.String )
+            {
+                var euler = HandlerBase.ParseVector3( el.GetString() );
+                return Rotation.From( euler.x, euler.y, euler.z );
+            }
+            if ( el.ValueKind == JsonValueKind.Object )
+            {
+                float pitch = el.TryGetProperty( "pitch", out var p ) ? p.GetSingle() : 0f;
+                float yaw = el.TryGetProperty( "yaw", out var y ) ? y.GetSingle() : 0f;
+                float roll = el.TryGetProperty( "roll", out var r ) ? r.GetSingle() : 0f;
+                return Rotation.From( pitch, yaw, roll );
+            }
+        }
+
+        if ( targetType == typeof( Color ) || targetType == typeof( Color32 ) )
+        {
+            if ( el.ValueKind == JsonValueKind.String )
+            {
+                var s = el.GetString();
+                var parts = s.Split( ',', StringSplitOptions.TrimEntries );
+                if ( parts.Length >= 3 )
+                {
+                    float r = float.Parse( parts[0] ) / 255f;
+                    float g = float.Parse( parts[1] ) / 255f;
+                    float b = float.Parse( parts[2] ) / 255f;
+                    float a = parts.Length > 3 ? float.Parse( parts[3] ) / 255f : 1f;
+                    return targetType == typeof( Color32 ) ? (object)new Color32( (byte)(r * 255), (byte)(g * 255), (byte)(b * 255), (byte)(a * 255) ) : new Color( r, g, b, a );
+                }
+                // Fallback to Color.Parse for hex ("#RRGGBB") and named colors (upstream bug fix)
+                var parsed = Color.Parse( s ) ?? default;
+                return targetType == typeof( Color32 ) ? (object)(Color32)parsed : parsed;
+            }
+            if ( el.ValueKind == JsonValueKind.Object )
+            {
+                float r = el.TryGetProperty( "r", out var rp ) ? rp.GetSingle() : 255f;
+                float g = el.TryGetProperty( "g", out var gp ) ? gp.GetSingle() : 255f;
+                float b = el.TryGetProperty( "b", out var bp ) ? bp.GetSingle() : 255f;
+                float a = el.TryGetProperty( "a", out var ap ) ? ap.GetSingle() : 255f;
+                return targetType == typeof( Color32 ) ? (object)new Color32( (byte)r, (byte)g, (byte)b, (byte)a ) : new Color( r / 255f, g / 255f, b / 255f, a / 255f );
+            }
+        }
+
+        if ( targetType.IsGenericType && targetType.GetGenericTypeDefinition() == typeof( List<> ) && el.ValueKind == JsonValueKind.Array )
+        {
+            var itemType = targetType.GetGenericArguments()[0];
+            var list = (System.Collections.IList)Activator.CreateInstance( targetType );
+            foreach ( var item in el.EnumerateArray() )
+                list.Add( ConvertJsonValue( item, itemType ) );
+            return list;
         }
 
         if ( targetType.IsEnum )
@@ -405,20 +459,7 @@ internal static class ComponentHandler
             object val;
             try
             {
-                var raw = prop.GetValue( comp );
-                val = raw switch
-                {
-                    null => null,
-                    bool b => (object)b,
-                    int i => (object)i,
-                    float f => (object)MathF.Round( f, 4 ),
-                    double d => (object)Math.Round( d, 4 ),
-                    string s => (object)s,
-                    Enum e => (object)e.ToString(),
-                    Vector3 v => (object)HandlerBase.V3( v ),
-                    Rotation r => (object)HandlerBase.Rot( r ),
-                    _ => (object)raw.ToString()
-                };
+                val = SchemaHelpers.FormatValue( prop.GetValue( comp ) );
             }
             catch
             {
@@ -428,9 +469,10 @@ internal static class ComponentHandler
             props.Add( new
             {
                 name = prop.Name,
-                type = prop.PropertyType.Name,
+                type = SchemaHelpers.FormatTypeName( prop.PropertyType ),
                 value = val,
-                canWrite = prop.CanWrite
+                canWrite = prop.CanWrite,
+                schema = SchemaHelpers.DescribeType( prop.PropertyType )
             } );
         }
 
@@ -438,8 +480,10 @@ internal static class ComponentHandler
         {
             gameObjectId = go.Id.ToString(),
             gameObjectName = go.Name,
+            handle = SceneHelpers.BuildHandle( go ),
             componentId = comp.Id.ToString(),
             componentType = comp.GetType().Name,
+            componentHandle = SceneHelpers.BuildHandle( comp ),
             enabled = comp.Enabled,
             properties = props
         } );
@@ -528,6 +572,103 @@ internal static class ComponentHandler
             target_name = targetGo.Name,
             new_component_id = newComp.Id.ToString(),
             message = $"Copied '{sourceComp.GetType().Name}' from '{sourceComp.GameObject.Name}' to '{targetGo.Name}'."
+        } );
+    }
+
+    // ── bulk_set ─────────────────────────────────────────────────────
+
+    private static object BulkSet( JsonElement args, string action )
+    {
+        var scene = SceneHelpers.ResolveScene();
+        if ( scene == null )
+            return HandlerBase.Error( "No active scene.", action );
+
+        var id = HandlerBase.GetString( args, "id" );
+        if ( string.IsNullOrEmpty( id ) )
+            return HandlerBase.Error( "Missing required 'id' parameter.", action );
+
+        var componentId = HandlerBase.GetString( args, "component_id" );
+        if ( string.IsNullOrEmpty( componentId ) )
+            return HandlerBase.Error( "Missing required 'component_id' parameter.", action );
+
+        if ( !args.TryGetProperty( "properties", out var propsEl ) )
+            return HandlerBase.Error( "Missing required 'properties' parameter. Provide an object or JSON string of {property: value} pairs.", action );
+
+        var go = SceneHelpers.FindByIdOrThrow( scene, id, action );
+        var comp = FindComponentByIdOrThrow( go, componentId, action );
+
+        JsonElement propsObj;
+        if ( propsEl.ValueKind == JsonValueKind.String )
+        {
+            var propsJson = propsEl.GetString();
+            if ( string.IsNullOrEmpty( propsJson ) )
+                return HandlerBase.Error( "Missing required 'properties' parameter. Provide an object or JSON string of {property: value} pairs.", action );
+
+            try
+            {
+                using var doc = JsonDocument.Parse( propsJson );
+                propsObj = doc.RootElement.Clone();
+            }
+            catch ( JsonException ex )
+            {
+                return HandlerBase.Error( $"Failed to parse 'properties' JSON: {ex.Message}", action );
+            }
+        }
+        else
+        {
+            propsObj = propsEl.Clone();
+        }
+
+        if ( propsObj.ValueKind != JsonValueKind.Object )
+            return HandlerBase.Error( "'properties' must be a JSON object, e.g. {\"Model\": \"path.vmdl\", \"Tint\": \"1,0,0,1\"}.", action );
+
+        var setResults = new List<object>();
+        var errors = new List<object>();
+
+        foreach ( var kvp in propsObj.EnumerateObject() )
+        {
+            var propName = kvp.Name;
+            var valEl = kvp.Value;
+
+            var prop = comp.GetType().GetProperty( propName,
+                System.Reflection.BindingFlags.Public | System.Reflection.BindingFlags.Instance );
+
+            if ( prop == null )
+            {
+                errors.Add( new { property = propName, error = $"Property '{propName}' not found on '{comp.GetType().Name}'." } );
+                continue;
+            }
+
+            if ( !prop.CanWrite )
+            {
+                errors.Add( new { property = propName, error = $"Property '{propName}' is read-only." } );
+                continue;
+            }
+
+            try
+            {
+                object converted = ConvertJsonValue( valEl, prop.PropertyType );
+                prop.SetValue( comp, converted );
+                var readback = prop.GetValue( comp );
+                setResults.Add( new { property = propName, value = readback?.ToString() } );
+            }
+            catch ( Exception ex )
+            {
+                errors.Add( new { property = propName, error = ex.Message } );
+            }
+        }
+
+        return HandlerBase.Success( new
+        {
+            id = go.Id.ToString(),
+            name = go.Name,
+            component_id = comp.Id.ToString(),
+            component_type = comp.GetType().Name,
+            set_count = setResults.Count,
+            error_count = errors.Count,
+            set = setResults,
+            errors,
+            message = $"Set {setResults.Count} properties on '{comp.GetType().Name}', {errors.Count} errors."
         } );
     }
 }

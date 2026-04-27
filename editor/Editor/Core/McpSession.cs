@@ -7,6 +7,7 @@ namespace Arenula;
 public class McpSession
 {
     public string SessionId { get; set; }
+    public string ProtocolVersion { get; set; } = "2025-03-26";
     public HttpListenerResponse SseResponse { get; set; }
     public TaskCompletionSource<bool> Tcs { get; set; } = new();
     public bool Initialized { get; set; }

@@ -28,12 +28,13 @@ internal static class HandlerBase
         content = new object[] { new { type = "text", text } }
     };
 
-    /// <summary>Serialize an object to JSON and wrap as MCP success response.</summary>
+    /// <summary>Serialize an object to JSON and wrap as MCP success response.
+    /// Large responses are automatically paginated via CursorStore.</summary>
     internal static object Success( object data )
     {
         var json = JsonSerializer.Serialize( data, Json );
         if ( json.Length > MaxResponseChars )
-            json = json[..MaxResponseChars] + "\n... [truncated]";
+            return CursorStore.StoreAndPage( json );
         return Text( json );
     }
 
@@ -55,10 +56,15 @@ internal static class HandlerBase
 
     /// <summary>Return a tool execution error with action context and suggestion.</summary>
     internal static object Error( string message, string action = null, string suggestion = null )
+        => Error( message, action, suggestion, null );
+
+    /// <summary>Return a tool execution error with structured diagnostics for agents.</summary>
+    internal static object Error( string message, string action, string suggestion, object details )
     {
-        var error = new Dictionary<string, string> { ["error"] = message };
+        var error = new Dictionary<string, object> { ["error"] = message };
         if ( action != null ) error["action"] = action;
         if ( suggestion != null ) error["suggestion"] = suggestion;
+        if ( details != null ) error["details"] = details;
         return new
         {
             content = new object[] { new { type = "text", text = JsonSerializer.Serialize( error, Json ) } },
@@ -162,6 +168,8 @@ internal static class HandlerBase
     /// <summary>Parse a "x,y,z" string into a Vector3.</summary>
     internal static Vector3 ParseVector3( string s )
     {
+        if ( string.IsNullOrWhiteSpace( s ) )
+            throw new ArgumentException( "Expected 'x,y,z' format, got empty string" );
         var parts = s.Split( ',' );
         if ( parts.Length != 3 ) throw new ArgumentException( $"Expected 'x,y,z' format, got '{s}'" );
         return new Vector3( float.Parse( parts[0].Trim() ), float.Parse( parts[1].Trim() ), float.Parse( parts[2].Trim() ) );
@@ -169,6 +177,8 @@ internal static class HandlerBase
 
     internal static Vector2 ParseVector2( string s )
     {
+        if ( string.IsNullOrWhiteSpace( s ) )
+            throw new ArgumentException( "Expected 'u,v' format, got empty string" );
         var parts = s.Split( ',' );
         if ( parts.Length != 2 ) throw new ArgumentException( $"Expected 'u,v' format, got '{s}'" );
         return new Vector2( float.Parse( parts[0].Trim() ), float.Parse( parts[1].Trim() ) );

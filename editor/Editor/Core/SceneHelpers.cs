@@ -66,7 +66,41 @@ internal static class SceneHelpers
     internal static GameObject FindById( Scene scene, string id )
     {
         if ( !Guid.TryParse( id, out var guid ) ) return null;
-        return WalkAll( scene ).FirstOrDefault( go => go.Id == guid );
+
+        // Strategy 1: Try Scene.GetAllObjects which includes map-spawned objects
+        try
+        {
+            foreach ( var go in scene.GetAllObjects( true ) )
+            {
+                if ( go.Id == guid ) return go;
+            }
+        }
+        catch { /* API may not exist in all versions */ }
+
+        // Strategy 2: Deep recursive walk through go.Children (no filtering)
+        foreach ( var root in scene.Children )
+        {
+            var result = FindInSubtreeUnfiltered( root, guid );
+            if ( result != null ) return result;
+        }
+
+        Log.Info( $"[Arenula] FindById FAILED for {guid} after exhaustive search" );
+        return null;
+    }
+
+    /// <summary>
+    /// Recursively searches for a GameObject by GUID with NO filtering at all.
+    /// This ensures map-spawned objects, disabled objects, and ignored objects are all found.
+    /// </summary>
+    private static GameObject FindInSubtreeUnfiltered( GameObject go, Guid guid )
+    {
+        if ( go.Id == guid ) return go;
+        foreach ( var child in go.Children )
+        {
+            var result = FindInSubtreeUnfiltered( child, guid );
+            if ( result != null ) return result;
+        }
+        return null;
     }
 
     internal static GameObject FindByIdOrThrow( Scene scene, string id, string action )
@@ -94,12 +128,34 @@ internal static class SceneHelpers
     internal static List<string> GetTags( GameObject go )
         => go.Tags.TryGetAll().ToList();
 
+    internal static object BuildHandle( GameObject go ) => new
+    {
+        kind = "gameobject",
+        id = go.Id.ToString(),
+        path = GetObjectPath( go ),
+        scene = go.Scene?.Name,
+        prefab_source = go.IsPrefabInstance ? go.PrefabInstanceSource : null,
+        parent_id = go.Parent?.Id.ToString(),
+        network_mode = go.NetworkMode.ToString()
+    };
+
+    internal static object BuildHandle( Component comp ) => new
+    {
+        kind = "component",
+        id = comp.Id.ToString(),
+        type = comp.GetType().Name,
+        gameobject_id = comp.GameObject?.Id.ToString(),
+        gameobject_name = comp.GameObject?.Name,
+        path = comp.GameObject != null ? GetObjectPath( comp.GameObject ) : null
+    };
+
     // ── Object summary builder ──────────────────────────────────────────
 
     internal static object BuildSummary( GameObject go ) => new
     {
         id = go.Id.ToString(),
         name = go.Name,
+        handle = BuildHandle( go ),
         enabled = go.Enabled,
         tags = GetTags( go ),
         components = GetComponentNames( go ),
@@ -111,6 +167,7 @@ internal static class SceneHelpers
     {
         id = go.Id.ToString(),
         name = go.Name,
+        handle = BuildHandle( go ),
         path = GetObjectPath( go ),
         enabled = go.Enabled,
         tags = GetTags( go ),
@@ -118,7 +175,8 @@ internal static class SceneHelpers
         {
             id = c.Id.ToString(),
             type = c.GetType().Name,
-            enabled = c.Enabled
+            enabled = c.Enabled,
+            handle = BuildHandle( c )
         } ),
         worldTransform = new
         {

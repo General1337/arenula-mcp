@@ -56,15 +56,19 @@ internal static class AssetQueryHandler
         var limit = HandlerBase.GetInt( args, "limit", 50 );
 
         var all = new List<Asset>();
+        // 2026-04-21 — normalize once (trim leading/trailing slashes) and
+        // check with an explicit path boundary so `foo` doesn't match
+        // `foobar/asset.vmat`. Prior impl used raw StartsWith(dir) which
+        // silently widened directory searches across sibling prefixes.
+        var dirFilter = ( directory ?? "" ).Trim().Trim( '/' );
+        var dirFilterWithSlash = dirFilter.Length > 0 ? dirFilter + "/" : "";
         foreach ( var asset in AssetSystem.All )
         {
-            if ( !string.IsNullOrEmpty( directory ) )
+            if ( dirFilter.Length > 0 )
             {
                 var aPath = asset.Path ?? "";
-                var dir = directory.TrimStart( '/' );
-                if ( dir.Length == 0 || aPath.StartsWith( dir, StringComparison.OrdinalIgnoreCase ) )
-                    { /* matches root or prefix */ }
-                else
+                if ( !aPath.Equals( dirFilter, StringComparison.OrdinalIgnoreCase )
+                     && !aPath.StartsWith( dirFilterWithSlash, StringComparison.OrdinalIgnoreCase ) )
                     continue;
             }
             all.Add( asset );

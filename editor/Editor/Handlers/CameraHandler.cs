@@ -247,7 +247,10 @@ internal static class CameraHandler
         if ( camComp == null )
             return HandlerBase.Error( "No CameraComponent found in scene.", "capture_tour" );
 
-        var pixmap  = new Pixmap( width, height );
+        // 2026-04-23 — Sandbox.Pixmap does not implement IDisposable (only
+        // Bitmap does). Prior `using var` pattern was a compile error after
+        // engine update. Plain local; GC handles cleanup.
+        var pixmap = new Pixmap( width, height );
         var content = new List<object>();
         var fired   = 0;
         var errors  = new List<string>();
@@ -326,7 +329,9 @@ internal static class CameraHandler
         if ( camComp == null )
             return HandlerBase.Error( "No CameraComponent found in scene.", "orbit_capture" );
 
-        var pixmap  = new Pixmap( width, height );
+        // 2026-04-23 — Sandbox.Pixmap is not IDisposable; prior `using` was a
+        // compile error after engine update. Plain local; GC handles cleanup.
+        var pixmap = new Pixmap( width, height );
         var content = new List<object>();
         var rendered = 0;
 
@@ -390,20 +395,29 @@ internal static class CameraHandler
         var origRot = go.WorldRotation;
         var origFov = camComp.FieldOfView;
 
-        go.WorldPosition = pos;
+        // 2026-04-21 — try-finally around the mutation block so a throw
+        // inside RenderToPixmap (or the math) doesn't leave the editor
+        // camera parked at the shot position with the wrong FoV.
+        bool ok;
+        try
+        {
+            go.WorldPosition = pos;
 
-        var dir    = lookAt - pos;
-        var horiz  = new Vector2( dir.x, dir.y );
-        var yaw    = MathF.Atan2( horiz.y, horiz.x ) * ( 180f / MathF.PI );
-        var pitch  = MathF.Atan2( -dir.z, horiz.Length ) * ( 180f / MathF.PI );
-        go.WorldRotation   = Rotation.From( pitch, yaw, 0f );
-        camComp.FieldOfView = fov;
+            var dir    = lookAt - pos;
+            var horiz  = new Vector2( dir.x, dir.y );
+            var yaw    = MathF.Atan2( horiz.y, horiz.x ) * ( 180f / MathF.PI );
+            var pitch  = MathF.Atan2( -dir.z, horiz.Length ) * ( 180f / MathF.PI );
+            go.WorldRotation   = Rotation.From( pitch, yaw, 0f );
+            camComp.FieldOfView = fov;
 
-        var ok = camComp.RenderToPixmap( pixmap );
-
-        go.WorldPosition   = origPos;
-        go.WorldRotation   = origRot;
-        camComp.FieldOfView = origFov;
+            ok = camComp.RenderToPixmap( pixmap );
+        }
+        finally
+        {
+            go.WorldPosition   = origPos;
+            go.WorldRotation   = origRot;
+            camComp.FieldOfView = origFov;
+        }
 
         if ( !ok ) return ( null, "RenderToPixmap failed" );
         var bytes = pixmap.GetJpeg( quality );
