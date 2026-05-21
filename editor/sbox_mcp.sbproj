@@ -20,7 +20,10 @@
       "TreatWarningsAsErrors": false,
       "Nullables": false,
       "ReleaseMode": "Release",
-      "AssemblyReferences": [],
+      "AssemblyReferences": [
+        "Editor/Libraries/Facepunch.AssemblySchema.dll",
+        "Editor/Libraries/Mono.Cecil.dll"
+      ],
       "ReplacementDirectives": {
         ".Server.cs": "SERVER"
       },
