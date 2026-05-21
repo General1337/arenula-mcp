@@ -3,7 +3,7 @@ using System.Collections.Generic;
 namespace Arenula;
 
 /// <summary>
-/// All 22 Arenula tool schemas for the MCP tools/list response.
+/// All 23 Arenula tool schemas for the MCP tools/list response.
 /// Each tool uses the omnibus pattern: required action enum + flat params.
 /// Descriptions follow Anthropic best practices: 3-4 sentences, negative guidance.
 /// </summary>
@@ -18,7 +18,7 @@ internal static class ToolRegistry
         Mesh, Lighting, Physics, Audio,
         Effects, Camera, Navmesh, Session,
         Project, Cloud, Terrain, Trace,
-        Player, Networking
+        Player, Networking, Schema
     };
 
     // ── Tool 1: scene ────────────────────────────────────────────────
@@ -712,6 +712,24 @@ internal static class ToolRegistry
                 ["enable_pressing"] = new { type = "boolean", description = "Allow use/press. Used by: configure_interaction." },
                 ["use_button"] = new { type = "string", description = "Button name for use. Used by: configure_interaction." },
                 ["reach_length"] = new { type = "number", description = "Interaction reach. Used by: configure_interaction." }
+            },
+            required = new[] { "action" },
+            additionalProperties = false
+        }
+    };
+
+    // ── Tool 23: schema ─────────────────────────────────────────────
+
+    internal static readonly object Schema = new
+    {
+        name = "schema",
+        description = "Manage the local arenula-api schema cache. The arenula-mcp plugin auto-regenerates the api schema from the user's installed Sandbox.*.dll on editor load when the engine hash has changed — this tool is for manual overrides and inspection. Actions: 'export' force-regenerates by shelling out to arenula-schemagen.exe (writes to ~/.arenula-api/api-data.json), 'info' reports cache state + staleness, 'clear' deletes the cache. The api server prefers this local file over CDN downloads.",
+        inputSchema = new
+        {
+            type = "object",
+            properties = new Dictionary<string, object>
+            {
+                ["action"] = new { type = "string", description = "The operation to perform.", @enum = new[] { "export", "info", "clear" } }
             },
             required = new[] { "action" },
             additionalProperties = false

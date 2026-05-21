@@ -144,6 +144,15 @@ public static class ArenulaMcpServer
 
             LogInfo( $"Started Model Context Protocol Server on port {Port}" );
             NotifyStateChanged();
+
+            // Auto-regen the arenula-api schema cache if Sandbox.Engine.dll has changed
+            // since last build. Fire-and-forget; never blocks plugin boot. Degraded-mode
+            // if it fails — arenula-api falls back to the CDN.
+            _ = Task.Run( async () =>
+            {
+                try { await SchemaExporter.RegenerateIfStale(); }
+                catch ( Exception ex ) { LogError( $"schema regen task faulted: {ex.Message}" ); }
+            } );
         }
         catch ( Exception ex )
         {

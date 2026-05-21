@@ -62,6 +62,11 @@ internal static class RpcDispatcher
                     logInfo?.Invoke( $"Running async tool {toolName}.{action}..." );
                     result = await CloudHandler.HandleAsync( action, args );
                 }
+                else if ( toolName == "schema" )
+                {
+                    logInfo?.Invoke( $"Running async tool {toolName}.{action}..." );
+                    result = await SchemaHandler.HandleAsync( action, args );
+                }
                 // ── Console (separate sync dispatch for exception safety) ─
                 else if ( toolName == "editor" && action is "console_run" or "console_list" )
                 {
