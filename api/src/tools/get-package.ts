@@ -1,6 +1,6 @@
 import type { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js'
 import { z } from 'zod'
-import { getPackage, searchPackages, type PackageDetail } from '../data/ugc-client.js'
+import { getPackage, searchPackages, UgcApiError, type PackageDetail } from '../data/ugc-client.js'
 
 function formatPackageDetails(pkg: PackageDetail, ident: string): string {
   const sections: string[] = []
@@ -59,13 +59,22 @@ export function registerGetPackage(server: McpServer) {
           content: [{ type: 'text' as const, text: formatPackageDetails(pkg, ident) }],
         }
       } catch (err) {
-        // Not found (or otherwise failed) - fall back to search for similar packages
+        if (!(err instanceof UgcApiError && err.status === 404)) {
+          return {
+            content: [{
+              type: 'text' as const,
+              text: `Error fetching package: ${err instanceof Error ? err.message : String(err)}`,
+            }],
+          }
+        }
+
+        // Not found - fall back to search for similar packages
         const parts = ident.split('.')
         const searchQuery = parts.length > 1 ? parts[1] : ident
 
         try {
           const response = await searchPackages({ query: searchQuery, take: 5 })
-          const suggestions = response.Packages.slice(0, 5)
+          const suggestions = response.Packages
             .map(p => `  - ${p.FullIdent} ("${p.Title}")`)
             .join('\n')
 

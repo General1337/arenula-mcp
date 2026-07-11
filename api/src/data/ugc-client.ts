@@ -1,5 +1,14 @@
 const UGC_API_BASE = 'https://public.facepunch.com/sbox/package'
 
+export class UgcApiError extends Error {
+  status: number
+  constructor(status: number, statusText: string) {
+    super(`UGC API error: ${status} ${statusText}`)
+    this.name = 'UgcApiError'
+    this.status = status
+  }
+}
+
 export const PACKAGE_TYPES = [
   'model', 'sound', 'material', 'map', 'game',
   'clothing', 'library', 'vsnd', 'prefab', 'shader',
@@ -93,7 +102,7 @@ export async function searchPackages(params: SearchPackagesParams): Promise<Sear
 
   const res = await fetch(url.toString())
   if (!res.ok) {
-    throw new Error(`UGC API error: ${res.status} ${res.statusText}`)
+    throw new UgcApiError(res.status, res.statusText)
   }
 
   return res.json() as Promise<SearchPackagesResponse>
@@ -104,7 +113,7 @@ export async function getPackage(ident: string): Promise<PackageDetail> {
 
   const res = await fetch(url)
   if (!res.ok) {
-    throw new Error(`UGC API error: ${res.status} ${res.statusText}`)
+    throw new UgcApiError(res.status, res.statusText)
   }
 
   return res.json() as Promise<PackageDetail>
