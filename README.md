@@ -97,7 +97,7 @@ Tools appear as `mcp__editor__*`, `mcp__api__*`, `mcp__docs__*` in your AI clien
 
 ## Editor Tools
 
-22 omnibus tools, 178 actions. Each tool takes a required `action` parameter.
+23 omnibus tools, 182 actions. Each tool takes a required `action` parameter.
 
 | Tool | Actions | Count |
 |------|---------|-------|
@@ -108,22 +108,26 @@ Tools appear as `mcp__editor__*`, `mcp__api__*`, `mcp__docs__*` in your AI clien
 | **prefab** | instantiate, get_structure, get_instances, break, update, create, save_overrides, revert, get_overrides | 9 |
 | **asset_query** | browse, search, open, get_dependencies, get_model_info, get_material_properties, get_mesh_info, get_bounds, get_unsaved, get_status, get_json, get_references | 12 |
 | **asset_manage** | create, delete, rename, move, save, reload, get_references | 7 |
-| **editor** | select, get/set_selected, clear/frame_selection, play controls, save, undo/redo, console, preferences, open_code_file, get_log | 18 |
+| **editor** | select, get/set_selected, clear/frame_selection, get_play_state, start/stop_play, get_log, save_scene, save_scene_as, save_all, undo/redo, console_list, console_run, open_code_file, get/set_preferences | 19 |
 | **session** | list, set_active, load_scene | 3 |
 | **lighting** | create, configure, create_skybox, set_skybox | 4 |
 | **physics** | add_collider, configure_collider, add_rigidbody, create_model_physics, create_character_controller, create_joint | 6 |
 | **audio** | create, configure | 2 |
-| **effects** | create, configure_particle, configure_post_processing | 3 |
+| **effects** | create, configure_particle, configure_post_processing, configure_sprite, configure_prop, configure_world_panel | 6 |
 | **camera** | create, configure, capture_viewport, capture_tour, orbit_capture | 5 |
 | **mesh** | create_block, create_plane, create_cylinder, create_wedge, create_arch, create_clutter, extrude_faces, remove_faces, add_face, clip_faces, scale_mesh, thicken_faces, bevel_edges, bevel_vertices, split_edges, quad_slice_faces, dissolve_edges, bridge_edges, connect_vertices, flip_faces, extend_edges, set_face_material, set_texture_params, vertex ops, get_info | 27 |
-| **navmesh** | create_agent, create_area, create_link, generate, get_status, query_path | 6 |
+| **navmesh** | create_agent, create_area, create_link, generate, generate_tile, unload_tile, set_defer_generation, get_status, query_path | 9 |
 | **cloud** | search, get_package, get_versions, mount | 4 |
 | **project** | get_collision, set_collision_rule, get_input, get_info | 4 |
-| **terrain** | create, configure, get_info, get_height, get_height_region, set_height, noise, erode, stamp, add/remove_material, get_material_at, blend_materials, set_hole, paint_material, import/export_heightmap, sync | 18 |
+| **terrain** | create, configure, get_info, get_height, get_height_region, set_height, noise, erode, stamp, add/remove_material, get_material_at, blend_materials, set_hole, paint_material, import/export_heightmap, sync, configure_clutter, regenerate_clutter, clear_clutter | 21 |
+| **trace** | ray, sphere_cast, box_cast, sample_grid, multi_ray | 5 |
+| **player** | create, configure_movement, configure_camera, configure_body, configure_interaction | 5 |
+| **networking** | add_helper, configure_object, get_status | 3 |
+| **schema** | export, info, clear | 3 |
 
 ## Architecture
 
-28 C# source files — 8 core infrastructure, 20 per-tool handlers.
+33 C# source files — 9 core infrastructure, 24 per-tool handlers (incl. `ConsoleHandler`).
 
 ![Architecture](architecture.png)
 

@@ -22,7 +22,7 @@ Open s&box — the plugin compiles automatically and starts the MCP server on `h
 
 ## Architecture
 
-8 core files, 20 handler files — one per tool.
+9 core files, 24 handler files (one per tool, plus `ConsoleHandler`).
 
 | Core | Purpose |
 |------|---------|
@@ -34,10 +34,11 @@ Open s&box — the plugin compiles automatically and starts the MCP server on `h
 | `McpServerWindow.cs` | Editor UI panel for server status |
 | `SceneHelpers.cs` | Shared scene query utilities |
 | `MaterialHelper.cs` | Material property helpers |
+| `SchemaExporter.cs` | Shells out to `arenula-schemagen.exe` to regenerate local `api-data.json` |
 
-## Tools (22)
+## Tools (23)
 
-Each tool uses an `action` enum parameter. 22 tools, 178 total actions.
+Each tool uses an `action` enum parameter. 23 tools, 182 total actions.
 
 | Tool | Actions |
 |------|---------|
@@ -48,18 +49,22 @@ Each tool uses an `action` enum parameter. 22 tools, 178 total actions.
 | **prefab** | instantiate, get_structure, get_instances, break, update, create, save_overrides, revert, get_overrides |
 | **asset_query** | browse, search, open, get_dependencies, get_model_info, get_material_properties, get_mesh_info, get_bounds, get_unsaved, get_status, get_json, get_references |
 | **asset_manage** | create, delete, rename, move, save, reload, get_references |
-| **editor** | select, get/set_selected, clear/frame_selection, play controls, save, undo/redo, console, preferences, open_code_file, get_log |
+| **editor** | select, get/set_selected, clear/frame_selection, get_play_state, start/stop_play, get_log, save_scene, save_scene_as, save_all, undo/redo, console_list, console_run, open_code_file, get/set_preferences |
 | **session** | list, set_active, load_scene |
 | **lighting** | create, configure, create_skybox, set_skybox |
 | **physics** | add_collider, configure_collider, add_rigidbody, create_model_physics, create_character_controller, create_joint |
 | **audio** | create, configure |
-| **effects** | create, configure_particle, configure_post_processing |
+| **effects** | create, configure_particle, configure_post_processing, configure_sprite, configure_prop, configure_world_panel |
 | **camera** | create, configure, capture_viewport, capture_tour, orbit_capture |
 | **mesh** | create_block, create_plane, create_cylinder, create_wedge, create_arch, create_clutter, extrude_faces, remove_faces, add_face, clip_faces, scale_mesh, thicken_faces, bevel_edges, bevel_vertices, split_edges, quad_slice_faces, dissolve_edges, bridge_edges, connect_vertices, flip_faces, extend_edges, set_face_material, set_texture_params, vertex ops, get_info |
-| **navmesh** | create_agent, create_area, create_link, generate, get_status, query_path |
+| **navmesh** | create_agent, create_area, create_link, generate, generate_tile, unload_tile, set_defer_generation, get_status, query_path |
 | **cloud** | search, get_package, get_versions, mount |
 | **project** | get_collision, set_collision_rule, get_input, get_info |
-| **terrain** | create, configure, get_info, get_height, get_height_region, set_height, noise, erode, stamp, add/remove_material, get_material_at, blend_materials, set_hole, paint_material, import/export_heightmap, sync |
+| **terrain** | create, configure, get_info, get_height, get_height_region, set_height, noise, erode, stamp, add/remove_material, get_material_at, blend_materials, set_hole, paint_material, import/export_heightmap, sync, configure_clutter, regenerate_clutter, clear_clutter |
+| **trace** | ray, sphere_cast, box_cast, sample_grid, multi_ray |
+| **player** | create, configure_movement, configure_camera, configure_body, configure_interaction |
+| **networking** | add_helper, configure_object, get_status |
+| **schema** | export, info, clear |
 
 ## License
 
