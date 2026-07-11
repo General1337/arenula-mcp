@@ -1,4 +1,4 @@
-const UGC_API_BASE = 'https://services.facepunch.com/sbox/package'
+const UGC_API_BASE = 'https://public.facepunch.com/sbox/package'
 
 export const PACKAGE_TYPES = [
   'model', 'sound', 'material', 'map', 'game',
@@ -45,6 +45,7 @@ export interface SearchPackagesResponse {
   Facets: unknown[]
   Tags?: Record<string, number>
   Orders?: Array<{ Name: string; Title: string; Icon: string }>
+  Properties?: unknown[]
 }
 
 export interface SearchPackagesParams {
@@ -57,10 +58,32 @@ export interface SearchPackagesParams {
   skip?: number
 }
 
+// Detail DTO returned by /get/2/{ident}. Unlike search results, it has no FullIdent
+// (the ident is already known by the caller) and Org is trimmed to Ident/Title/Thumb.
+export interface PackageDetail {
+  Org: PackageOrg
+  Ident: string
+  Title: string
+  Summary?: string
+  Thumb?: string
+  ThumbWide?: string
+  ThumbTall?: string
+  TypeName: string
+  Updated: string
+  Created: string
+  UsageStats?: Record<string, unknown>
+  Tags?: string[]
+  Favourited?: number
+  VotesUp?: number
+  Public?: boolean
+}
+
 export async function searchPackages(params: SearchPackagesParams): Promise<SearchPackagesResponse> {
-  const url = new URL(`${UGC_API_BASE}/find`)
+  const url = new URL(`${UGC_API_BASE}/find/2`)
 
   url.searchParams.set('q', params.query)
+  // type/category/tag/order predate find/2 and are empirically no-ops there (verified:
+  // identical results with and without them), but they're harmless so we keep passing them.
   if (params.type) url.searchParams.set('type', params.type)
   if (params.category) url.searchParams.set('category', params.category)
   if (params.tag) url.searchParams.set('tag', params.tag)
@@ -74,4 +97,15 @@ export async function searchPackages(params: SearchPackagesParams): Promise<Sear
   }
 
   return res.json() as Promise<SearchPackagesResponse>
+}
+
+export async function getPackage(ident: string): Promise<PackageDetail> {
+  const url = `${UGC_API_BASE}/get/2/${encodeURIComponent(ident)}`
+
+  const res = await fetch(url)
+  if (!res.ok) {
+    throw new Error(`UGC API error: ${res.status} ${res.statusText}`)
+  }
+
+  return res.json() as Promise<PackageDetail>
 }
