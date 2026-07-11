@@ -87,10 +87,12 @@ export function registerGetPackage(server: McpServer) {
             }],
           }
         } catch {
+          // The primary lookup already 404'd (that is why we are here); the
+          // suggestion search then failed too. Report not-found, not the 404.
           return {
             content: [{
               type: 'text' as const,
-              text: `Error fetching package: ${err instanceof Error ? err.message : String(err)}`,
+              text: `Package "${ident}" not found. (Could not fetch similar-package suggestions.)`,
             }],
           }
         }
