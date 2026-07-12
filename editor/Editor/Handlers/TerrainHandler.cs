@@ -1346,6 +1346,11 @@ internal static class TerrainHandler
                 return false;
             }
 
+            // RegisterFile alone may hand back the cached asset without recompiling the
+            // rewritten bytes; force a compile so the .terrain_c reflects the new data
+            // (same pattern as AssetManageHandler.Save).
+            asset.Compile( true );
+
             // If storage already points to a valid file, the rewrite + recompile is enough
             var alreadyBacked = !string.IsNullOrEmpty( storage.ResourcePath )
                                 && storage.ResourcePath != "sandbox.terrain";
