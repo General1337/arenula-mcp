@@ -76,9 +76,6 @@ public static class ArenulaMcpServer
     // ── Internal state ─────────────────────────────────────────────────────
     private static HttpListener _listener;
     private static CancellationTokenSource _cts;
-    // Tracks the accept loop so a hotload can tell "listener bound" from "loop alive"
-    // and respawn the loop if it didn't survive (see OnHotload).
-    private static Task _listenLoopTask;
     private static readonly ConcurrentDictionary<string, McpSession> _sessions = new();
 
     // Tracks in-flight RPC tasks so StopServer can wait for them to finish
@@ -151,7 +148,7 @@ public static class ArenulaMcpServer
             _listener.Start();
 
             _cts = new CancellationTokenSource();
-            _listenLoopTask = Task.Run( () => ListenLoop( _cts.Token ) );
+            _ = Task.Run( () => ListenLoop( _cts.Token ) );
 
             LogInfo( $"Started Model Context Protocol Server on port {Port}" );
             NotifyStateChanged();
@@ -183,7 +180,6 @@ public static class ArenulaMcpServer
             }
 
             _cts?.Cancel();
-            _listenLoopTask = null;
 
             try { _listener?.Stop(); } catch { }
             try { _listener?.Close(); } catch { }
@@ -312,7 +308,9 @@ public static class ArenulaMcpServer
                 finally { session.WriteLock.Release(); }
             }
         }
-        catch ( Exception ex ) { LogError( $"SSE connection error: {ex.Message}" ); }
+        // Client disconnects surface here as write/flush failures — routine (every hotload
+        // drops all sessions), so log as info rather than error.
+        catch ( Exception ex ) { LogInfo( $"SSE client disconnected: {ex.Message}" ); }
         finally
         {
             _sessions.TryRemove( sessionId, out _ );
