@@ -13,7 +13,7 @@ npm run build
 node dist/index.js
 ```
 
-## Tools (9)
+## Tools (10)
 
 | Tool | Purpose |
 |---|---|
@@ -26,6 +26,7 @@ node dist/index.js
 | `search_packages` | Search s&box Workshop/UGC |
 | `get_package` | Get Workshop package details |
 | `textures` | Search, download, and generate .tmat files from PBR texture providers (ambientCG, Poly Haven) |
+| `models` | Search, get info on, and download free CC0 3D models from Poly Haven |
 
 ## Updating API Data
 

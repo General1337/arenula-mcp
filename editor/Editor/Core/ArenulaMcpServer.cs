@@ -76,6 +76,9 @@ public static class ArenulaMcpServer
     // ── Internal state ─────────────────────────────────────────────────────
     private static HttpListener _listener;
     private static CancellationTokenSource _cts;
+    // Tracks the accept loop so a hotload can tell "listener bound" from "loop alive"
+    // and respawn the loop if it didn't survive (see OnHotload).
+    private static Task _listenLoopTask;
     private static readonly ConcurrentDictionary<string, McpSession> _sessions = new();
 
     // Tracks in-flight RPC tasks so StopServer can wait for them to finish
@@ -107,14 +110,39 @@ public static class ArenulaMcpServer
     // ── Lifecycle ──────────────────────────────────────────────────────────
 
     /// <summary>
-    /// On hotload, stop the existing server (which retains its listener reference via
-    /// preserved static state) and restart it so new handler code is picked up.
+    /// On hotload, keep the listener (and every live SSE session) alive instead of the old
+    /// StopServer()+StartServer(), which dropped every connected client on every C# save.
+    /// Handler code is reached by direct static calls from the accept loop, so picking up new
+    /// handler logic depends on how s&box hotload works (in-place body swap vs. loop respawn).
+    ///
+    /// We distinguish "listener bound" from "accept loop alive": if the loop task died but the
+    /// listener survived, respawn the loop on the existing listener (don't rebind — the port is
+    /// still held). This closes the recovery trap where IsRunning reads true but nothing is
+    /// accepting connections.
+    ///
+    /// VERIFY IN-EDITOR (cannot be tested headless): after a C# save —
+    ///   1. a NEW SSE client can still connect and receive the endpoint event (loop alive);
+    ///   2. editing a handler's output then invoking it over an EXISTING session returns the
+    ///      NEW value (new code is executed, not stale IL) — if this fails, hotload does not
+    ///      swap the running loop's code and this must revert to StopServer()+StartServer().
     /// </summary>
     [EditorEvent.Hotload]
     public static void OnHotload()
     {
-        if ( IsRunning ) StopServer();
-        StartServer();
+        // Listener not bound at all → full start.
+        if ( _listener == null || !_listener.IsListening )
+        {
+            StartServer();
+            return;
+        }
+
+        // Listener survived but the accept loop may not have. Respawn it on the existing
+        // listener if it's gone/completed/faulted; otherwise leave the running loop alone.
+        if ( _listenLoopTask == null || _listenLoopTask.IsCompleted )
+        {
+            _cts ??= new CancellationTokenSource();
+            _listenLoopTask = Task.Run( () => ListenLoop( _cts.Token ) );
+        }
     }
 
     public static void StartServer()
@@ -140,7 +168,7 @@ public static class ArenulaMcpServer
             _listener.Start();
 
             _cts = new CancellationTokenSource();
-            Task.Run( () => ListenLoop( _cts.Token ) );
+            _listenLoopTask = Task.Run( () => ListenLoop( _cts.Token ) );
 
             LogInfo( $"Started Model Context Protocol Server on port {Port}" );
             NotifyStateChanged();
@@ -172,6 +200,7 @@ public static class ArenulaMcpServer
             }
 
             _cts?.Cancel();
+            _listenLoopTask = null;
 
             try { _listener?.Stop(); } catch { }
             try { _listener?.Close(); } catch { }
@@ -274,8 +303,13 @@ public static class ArenulaMcpServer
         {
             var msg    = $"event: endpoint\ndata: /message?sessionId={sessionId}\n\n";
             var buffer = Encoding.UTF8.GetBytes( msg );
-            await res.OutputStream.WriteAsync( buffer, 0, buffer.Length );
-            await res.OutputStream.FlushAsync();
+            await session.WriteLock.WaitAsync();
+            try
+            {
+                await res.OutputStream.WriteAsync( buffer, 0, buffer.Length );
+                await res.OutputStream.FlushAsync();
+            }
+            finally { session.WriteLock.Release(); }
 
             LogInfo( $"Created new MCP SSE session: {sessionId}" );
             NotifyStateChanged();
@@ -286,8 +320,13 @@ public static class ArenulaMcpServer
                 var done = await Task.WhenAny( session.Tcs.Task, Task.Delay( 30_000 ) );
                 if ( done == session.Tcs.Task || _cts.IsCancellationRequested ) break;
                 var ping = Encoding.UTF8.GetBytes( ": ping\n\n" );
-                await res.OutputStream.WriteAsync( ping, 0, ping.Length );
-                await res.OutputStream.FlushAsync(); // throws if client is gone → caught below
+                await session.WriteLock.WaitAsync();
+                try
+                {
+                    await res.OutputStream.WriteAsync( ping, 0, ping.Length );
+                    await res.OutputStream.FlushAsync(); // throws if client is gone → caught below
+                }
+                finally { session.WriteLock.Release(); }
             }
         }
         catch ( Exception ex ) { LogError( $"SSE connection error: {ex.Message}" ); }
@@ -382,6 +421,7 @@ public static class ArenulaMcpServer
     internal static async Task SendSseEvent( McpSession session, string eventName, string data )
     {
         if ( session.SseResponse == null || !session.SseResponse.OutputStream.CanWrite ) return;
+        await session.WriteLock.WaitAsync();
         try
         {
             var msg    = $"event: {eventName}\ndata: {data}\n\n";
@@ -392,6 +432,10 @@ public static class ArenulaMcpServer
         catch ( Exception ex )
         {
             LogWarning( $"Failed to send SSE event to session {session.SessionId}: {ex.Message}" );
+        }
+        finally
+        {
+            session.WriteLock.Release();
         }
     }
 }

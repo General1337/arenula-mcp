@@ -4,14 +4,14 @@
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Arenula — MCP Server Suite for s&amp;box</title>
-    <meta name="description" content="Connect AI coding assistants to the s&amp;box game engine. 22 tools, 178 actions, 3 servers. Scene manipulation, API reference, documentation — all over MCP.">
+    <meta name="description" content="Connect AI coding assistants to the s&amp;box game engine. 23 tools, 182 actions, 3 servers. Scene manipulation, API reference, documentation — all over MCP.">
     <meta property="og:title" content="Arenula — MCP Server Suite for s&amp;box">
-    <meta property="og:description" content="Connect AI coding assistants to the s&amp;box game engine. 22 tools, 178 actions, 3 servers.">
+    <meta property="og:description" content="Connect AI coding assistants to the s&amp;box game engine. 23 tools, 182 actions, 3 servers.">
     <meta property="og:type" content="website">
     <meta property="og:url" content="https://nyx000.github.io/arenula-mcp/">
     <meta name="twitter:card" content="summary">
     <meta name="twitter:title" content="Arenula — MCP Server Suite for s&amp;box">
-    <meta name="twitter:description" content="Connect AI coding assistants to the s&amp;box game engine. 22 tools, 178 actions, 3 servers.">
+    <meta name="twitter:description" content="Connect AI coding assistants to the s&amp;box game engine. 23 tools, 182 actions, 3 servers.">
     <style>
         :root {
             --bg: #0c0c14;
@@ -637,8 +637,8 @@
             <a href="https://github.com/Nyx000/Arenula-MCP" class="btn-secondary" target="_blank">View Source</a>
         </div>
         <div class="hero-stats">
-            <div class="hero-stat"><div class="n">22</div><div class="l">Tools</div></div>
-            <div class="hero-stat"><div class="n">179</div><div class="l">Actions</div></div>
+            <div class="hero-stat"><div class="n">23</div><div class="l">Tools</div></div>
+            <div class="hero-stat"><div class="n">182</div><div class="l">Actions</div></div>
             <div class="hero-stat"><div class="n">3</div><div class="l">Servers</div></div>
             <div class="hero-stat"><div class="n">8-13K</div><div class="l">Tokens</div></div>
         </div>
@@ -655,12 +655,12 @@
             <div class="srv">
                 <h3>Editor</h3>
                 <p>Scene manipulation, code compilation, asset management, terrain editing. Runs inside the s&box editor as a C# library plugin.</p>
-                <div class="srv-meta"><span>22 tools</span><span>SSE :8098</span><span>C#</span></div>
+                <div class="srv-meta"><span>23 tools</span><span>SSE :8098</span><span>C#</span></div>
             </div>
             <div class="srv">
                 <h3>API</h3>
                 <p>Offline type and member reference. Indexes ~1,800 types and ~15,000 members from the s&box CDN schema. Also fetches PBR textures from ambientCG and Poly Haven.</p>
-                <div class="srv-meta"><span>9 tools</span><span>stdio</span><span>TypeScript</span></div>
+                <div class="srv-meta"><span>10 tools</span><span>stdio</span><span>TypeScript</span></div>
             </div>
             <div class="srv">
                 <h3>Docs</h3>
@@ -676,7 +676,7 @@
 <div class="section">
     <div class="wrap">
         <h2 id="tools">Editor Tools</h2>
-        <p>22 omnibus tools, 178 actions. Each takes a required <code>action</code> parameter to select the operation.</p>
+        <p>23 omnibus tools, 182 actions. Each takes a required <code>action</code> parameter to select the operation.</p>
         <div class="tools">
             <div class="t"><div class="t-name">scene</div><div class="t-acts"><code>summary</code> <code>hierarchy</code> <code>statistics</code> <code>find</code> <code>find_in_radius</code> <code>get_details</code> <code>prefab_instances</code></div><div class="t-n">7</div></div>
             <div class="t"><div class="t-name">gameobject</div><div class="t-acts"><code>create</code> <code>destroy</code> <code>duplicate</code> <code>reparent</code> <code>rename</code> <code>enable</code> <code>set_tags</code> <code>set_transform</code> <code>batch_transform</code></div><div class="t-n">9</div></div>
@@ -690,13 +690,17 @@
             <div class="t"><div class="t-name">lighting</div><div class="t-acts"><code>create</code> <code>configure</code> <code>create_skybox</code> <code>set_skybox</code></div><div class="t-n">4</div></div>
             <div class="t"><div class="t-name">physics</div><div class="t-acts"><code>add_collider</code> <code>configure_collider</code> <code>add_rigidbody</code> <code>create_model_physics</code> <code>create_character_controller</code> <code>create_joint</code></div><div class="t-n">6</div></div>
             <div class="t"><div class="t-name">audio</div><div class="t-acts"><code>create</code> <code>configure</code></div><div class="t-n">2</div></div>
-            <div class="t"><div class="t-name">effects</div><div class="t-acts"><code>create</code> <code>configure_particle</code> <code>configure_post_processing</code></div><div class="t-n">3</div></div>
+            <div class="t"><div class="t-name">effects</div><div class="t-acts"><code>create</code> <code>configure_particle</code> <code>configure_post_processing</code> <code>configure_sprite</code> <code>configure_prop</code> <code>configure_world_panel</code></div><div class="t-n">6</div></div>
             <div class="t"><div class="t-name">camera</div><div class="t-acts"><code>create</code> <code>configure</code> <code>capture_viewport</code> <code>capture_tour</code> <code>orbit_capture</code></div><div class="t-n">5</div></div>
             <div class="t"><div class="t-name">mesh</div><div class="t-acts"><code>create_block</code> <code>create_plane</code> <code>create_cylinder</code> <code>create_wedge</code> <code>create_arch</code> <code>create_clutter</code> <code>extrude_faces</code> <code>remove_faces</code> <code>add_face</code> <code>clip_faces</code> <code>scale_mesh</code> <code>thicken_faces</code> <code>bevel_edges</code> <code>bevel_vertices</code> <code>split_edges</code> <code>quad_slice_faces</code> <code>dissolve_edges</code> <code>bridge_edges</code> <code>connect_vertices</code> <code>flip_faces</code> <code>extend_edges</code> <code>set_face_material</code> <code>set_texture_params</code> <code>set_vertex_position</code> <code>set_vertex_color</code> <code>set_vertex_blend</code> <code>get_info</code></div><div class="t-n">27</div></div>
-            <div class="t"><div class="t-name">navmesh</div><div class="t-acts"><code>create_agent</code> <code>create_area</code> <code>create_link</code> <code>generate</code> <code>get_status</code> <code>query_path</code></div><div class="t-n">6</div></div>
+            <div class="t"><div class="t-name">navmesh</div><div class="t-acts"><code>create_agent</code> <code>create_area</code> <code>create_link</code> <code>generate</code> <code>generate_tile</code> <code>unload_tile</code> <code>set_defer_generation</code> <code>get_status</code> <code>query_path</code></div><div class="t-n">9</div></div>
             <div class="t"><div class="t-name">cloud</div><div class="t-acts"><code>search</code> <code>get_package</code> <code>get_versions</code> <code>mount</code></div><div class="t-n">4</div></div>
             <div class="t"><div class="t-name">project</div><div class="t-acts"><code>get_collision</code> <code>set_collision_rule</code> <code>get_input</code> <code>get_info</code></div><div class="t-n">4</div></div>
-            <div class="t"><div class="t-name">terrain</div><div class="t-acts"><code>create</code> <code>configure</code> <code>get_info</code> <code>get_height</code> <code>get_height_region</code> <code>set_height</code> <code>noise</code> <code>erode</code> <code>stamp</code> <code>add_material</code> <code>remove_material</code> <code>get_material_at</code> <code>blend_materials</code> <code>set_hole</code> <code>paint_material</code> <code>import_heightmap</code> <code>export_heightmap</code> <code>sync</code></div><div class="t-n">18</div></div>
+            <div class="t"><div class="t-name">terrain</div><div class="t-acts"><code>create</code> <code>configure</code> <code>get_info</code> <code>get_height</code> <code>get_height_region</code> <code>set_height</code> <code>noise</code> <code>erode</code> <code>stamp</code> <code>add_material</code> <code>remove_material</code> <code>get_material_at</code> <code>blend_materials</code> <code>set_hole</code> <code>paint_material</code> <code>import_heightmap</code> <code>export_heightmap</code> <code>sync</code> <code>configure_clutter</code> <code>regenerate_clutter</code> <code>clear_clutter</code></div><div class="t-n">21</div></div>
+            <div class="t"><div class="t-name">trace</div><div class="t-acts"><code>ray</code> <code>sphere_cast</code> <code>box_cast</code> <code>sample_grid</code> <code>multi_ray</code></div><div class="t-n">5</div></div>
+            <div class="t"><div class="t-name">player</div><div class="t-acts"><code>create</code> <code>configure_movement</code> <code>configure_camera</code> <code>configure_body</code> <code>configure_interaction</code></div><div class="t-n">5</div></div>
+            <div class="t"><div class="t-name">networking</div><div class="t-acts"><code>add_helper</code> <code>configure_object</code> <code>get_status</code></div><div class="t-n">3</div></div>
+            <div class="t"><div class="t-name">schema</div><div class="t-acts"><code>export</code> <code>info</code> <code>clear</code></div><div class="t-n">3</div></div>
         </div>
     </div>
 </div>
@@ -706,7 +710,7 @@
 <div class="section">
     <div class="wrap">
         <h2 id="architecture">Architecture</h2>
-        <p>28 C# source files organized into Core infrastructure and per-tool Handlers.</p>
+        <p>33 C# source files organized into Core infrastructure and per-tool Handlers.</p>
 
         <div class="arch-flow">
             <div class="arch-node client">
@@ -728,7 +732,7 @@
                 <div class="arch-branch">
                     <div class="arch-branch-card">
                         <div class="branch-title">Async Path</div>
-                        <div class="branch-desc">compile, cloud<br>Background thread<br>No deadlocks</div>
+                        <div class="branch-desc">compile, cloud, schema<br>Background thread<br>No deadlocks</div>
                     </div>
                 </div>
                 <div class="arch-branch">
@@ -748,12 +752,12 @@
 
         <div class="arch-details">
             <div class="arch-detail-card">
-                <h4>Core <span class="count">8 files</span></h4>
-                <p><code>ArenulaMcpServer</code> HTTP/SSE listener and session management. <code>RpcDispatcher</code> extracts tool name + action, routes to the correct handler. <code>ToolRegistry</code> holds all 22 tool schemas. <code>HandlerBase</code> provides response formatting, pagination, and error helpers. <code>SceneHelpers</code> handles scene resolution and tree walking.</p>
+                <h4>Core <span class="count">9 files</span></h4>
+                <p><code>ArenulaMcpServer</code> HTTP/SSE listener and session management. <code>RpcDispatcher</code> extracts tool name + action, routes to the correct handler. <code>ToolRegistry</code> holds all 23 tool schemas. <code>HandlerBase</code> provides response formatting, pagination, and error helpers. <code>SceneHelpers</code> handles scene resolution and tree walking. <code>SchemaExporter</code> shells out to <code>arenula-schemagen.exe</code> to regenerate the local <code>api-data.json</code>.</p>
             </div>
             <div class="arch-detail-card">
-                <h4>Handlers <span class="count">20 files</span></h4>
-                <p>One file per tool. Each exports a <code>Handle(action, args)</code> method with an internal switch on the action enum. Async handlers (<code>CompileHandler</code>, <code>CloudHandler</code>) use <code>HandleAsync</code> and dispatch before <code>GameTask.MainThread()</code> to prevent deadlocks.</p>
+                <h4>Handlers <span class="count">24 files</span></h4>
+                <p>One file per tool, plus <code>ConsoleHandler</code>. Each exports a <code>Handle(action, args)</code> method with an internal switch on the action enum. Async handlers (<code>CompileHandler</code>, <code>CloudHandler</code>, <code>SchemaHandler</code>) use <code>HandleAsync</code> and dispatch before <code>GameTask.MainThread()</code> to prevent deadlocks.</p>
             </div>
             <div class="arch-detail-card">
                 <h4>Threading Model</h4>
