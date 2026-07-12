@@ -1297,13 +1297,15 @@ internal static class TerrainHandler
     /// Persist TerrainStorage as a file-backed .terrain asset so the scene serializes
     /// a real resource reference instead of null.
     ///
-    /// The source .terrain JSON is written to the project directory (terrain_data/).
-    /// The compiled .terrain_c is cached in sbox/core/terrain_data/ — this is a
-    /// limitation of AssetSystem.CompileResource which always resolves relative paths
-    /// against the engine's core mount. RegisterFile(absPath) returns null because the
-    /// asset path collides with the existing core-mounted entry, so we fall back to
-    /// FindByPath. A sync call regenerates the compiled cache if it's ever lost
-    /// (e.g. after an engine update).
+    /// The source .terrain JSON is written to the project directory (terrain_data/)
+    /// using an ABSOLUTE path resolved via HandlerBase.ResolveProjectPath. The file is
+    /// then handed to AssetSystem.RegisterFile( absPath ), which indexes it and compiles
+    /// it on demand — the same pattern AssetManageHandler uses. We must never pass a
+    /// bare relative path (e.g. "terrain_data/foo.terrain") to the asset compiler: the
+    /// native side resolves relative paths against the engine's process CWD
+    /// (…\sbox\), not the project root, which fails with "Could not find file" and
+    /// throws a NullReference inside the compiler. RegisterFile may return null when the
+    /// path collides with an already-mounted entry, so we fall back to FindByPath.
     /// </summary>
     private static bool TryPersistStorageAsFile( Terrain terrain )
     {
@@ -1315,27 +1317,32 @@ internal static class TerrainHandler
             var name = terrain.GameObject.Name?.ToLower().Replace( ' ', '_' ) ?? "terrain";
             var relativePath = $"terrain_data/{name}.terrain";
             var absPath = HandlerBase.ResolveProjectPath( relativePath );
-            if ( absPath == null ) return false;
+            if ( absPath == null )
+            {
+                Log.Warning( "[terrain] Could not resolve project root — terrain storage not persisted." );
+                return false;
+            }
 
             var dir = System.IO.Path.GetDirectoryName( absPath );
             if ( !string.IsNullOrEmpty( dir ) && !System.IO.Directory.Exists( dir ) )
                 System.IO.Directory.CreateDirectory( dir );
 
-            // Always write current serialized data to the source file
+            // Always write current serialized data to the source file (absolute path).
             var json = storage.Serialize();
             var jsonText = json.ToJsonString();
             System.IO.File.WriteAllText( absPath, jsonText );
 
-            // Compile the resource data so the engine has an up-to-date .terrain_c
-            AssetSystem.CompileResource( relativePath, jsonText );
-
-            // Find or register the asset so we can load the compiled resource
-            var asset = AssetSystem.FindByPath( relativePath )
-                     ?? AssetSystem.RegisterFile( absPath );
+            // Register the written file so the asset system indexes and compiles it.
+            // RegisterFile takes the ABSOLUTE path — the previous CompileResource call
+            // passed a bare relative path that the native compiler resolved against the
+            // engine install dir (process CWD), logging "Could not find file
+            // '...\sbox\terrain_data\...'" and a NullReference inside the compiler.
+            var asset = AssetSystem.RegisterFile( absPath )
+                     ?? AssetSystem.FindByPath( relativePath );
 
             if ( asset == null )
             {
-                Log.Warning( $"[terrain] Asset not found after compile: {relativePath}" );
+                Log.Warning( $"[terrain] Asset not registered after write: {relativePath}" );
                 return false;
             }
 
