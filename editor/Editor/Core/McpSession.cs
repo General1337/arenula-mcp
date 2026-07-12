@@ -1,4 +1,5 @@
 using System.Net;
+using System.Threading;
 using System.Threading.Tasks;
 
 namespace Arenula;
@@ -10,4 +11,11 @@ public class McpSession
     public HttpListenerResponse SseResponse { get; set; }
     public TaskCompletionSource<bool> Tcs { get; set; } = new();
     public bool Initialized { get; set; }
+
+    /// <summary>
+    /// Serializes all writes to <see cref="SseResponse"/>'s output stream. Multiple RPC
+    /// completions (compile/cloud/schema finish off-thread) plus the keep-alive ping loop
+    /// can otherwise interleave byte writes on the same stream and corrupt the SSE framing.
+    /// </summary>
+    public SemaphoreSlim WriteLock { get; } = new( 1, 1 );
 }
