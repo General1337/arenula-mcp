@@ -13,25 +13,41 @@ namespace Arenula;
 /// </summary>
 internal static class SceneHelpers
 {
-    // ── Scene resolution ────────────────────────────────────────────────
+    // ── Scene / session resolution ──────────────────────────────────────
 
     /// <summary>
-    /// Returns the best available scene:
-    /// 1. Active SceneEditorSession.Scene (editor)
-    /// 2. First available editor session
-    /// 3. Game.ActiveScene (play mode)
-    /// 4. null
+    /// Returns the active editor session, falling back to the first open session
+    /// with a valid scene. session.list surfaces SceneEditorSession.All; the
+    /// editor's transient focus state can leave .Active null even while .All still
+    /// holds the session (e.g. the scene tab isn't the focused dock), so all
+    /// session-bound actions resolve through here to stay consistent with what
+    /// session.list reports and avoid spurious "No editor session" failures.
     /// </summary>
-    internal static Scene ResolveScene()
+    internal static SceneEditorSession ResolveSession()
     {
         try
         {
             var active = SceneEditorSession.Active;
-            if ( active?.Scene != null ) return active.Scene;
-            foreach ( var s in SceneEditorSession.All )
-                if ( s?.Scene != null ) return s.Scene;
+            if ( active?.Scene != null ) return active;
+            var all = SceneEditorSession.All;
+            if ( all != null )
+                foreach ( var s in all )
+                    if ( s?.Scene != null ) return s;
         }
         catch { }
+        return null;
+    }
+
+    /// <summary>
+    /// Returns the best available scene:
+    /// 1. Resolved editor session scene (active, else first open)
+    /// 2. Game.ActiveScene (play mode)
+    /// 3. null
+    /// </summary>
+    internal static Scene ResolveScene()
+    {
+        var session = ResolveSession();
+        if ( session?.Scene != null ) return session.Scene;
         if ( Game.ActiveScene != null ) return Game.ActiveScene;
         return null;
     }
@@ -199,7 +215,7 @@ internal static class SceneHelpers
     internal static List<GameObject> GetSelectedGameObjects()
     {
         var result = new List<GameObject>();
-        var sel = SceneEditorSession.Active?.Selection;
+        var sel = ResolveSession()?.Selection;
         if ( sel == null ) return result;
         foreach ( var o in sel )
             if ( o is GameObject go ) result.Add( go );
@@ -208,12 +224,12 @@ internal static class SceneHelpers
 
     /// <summary>Sets the editor selection to a single GameObject.</summary>
     internal static bool SelectGameObject( GameObject go )
-        => SceneEditorSession.Active?.Selection?.Set( go ) ?? false;
+        => ResolveSession()?.Selection?.Set( go ) ?? false;
 
     /// <summary>Clears the editor selection.</summary>
     internal static bool ClearSelection()
     {
-        var sel = SceneEditorSession.Active?.Selection;
+        var sel = ResolveSession()?.Selection;
         if ( sel == null ) return false;
         sel.Clear();
         return true;
@@ -221,7 +237,7 @@ internal static class SceneHelpers
 
     /// <summary>Adds a GameObject to the editor selection.</summary>
     internal static bool AddToSelection( GameObject go )
-        => SceneEditorSession.Active?.Selection?.Add( go ) ?? false;
+        => ResolveSession()?.Selection?.Add( go ) ?? false;
 
     /// <summary>
     /// Gets the world-space bounding box of a GameObject, trying collider bounds first,

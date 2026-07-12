@@ -21,6 +21,9 @@ internal static class EditorHandler
     private static readonly System.Collections.Concurrent.ConcurrentQueue<string> _log = new();
     private const int MaxLogLines = 2000;
 
+    // Shared suggestion for session-bound actions when no session resolves.
+    private const string NoSessionHint = "Open a scene tab (session.load_scene) and confirm it appears in session.list.";
+
     /// <summary>Called by the MCP server to capture log output.</summary>
     internal static void AppendLog( string msg )
     {
@@ -144,8 +147,8 @@ internal static class EditorHandler
         var scene = SceneHelpers.ResolveScene();
         if ( scene == null ) return HandlerBase.Error( "No active scene.", "frame_selection" );
 
-        var session = SceneEditorSession.Active;
-        if ( session == null ) return HandlerBase.Error( "No editor session.", "frame_selection" );
+        var session = SceneHelpers.ResolveSession();
+        if ( session == null ) return HandlerBase.Error( "No editor session active.", "frame_selection", NoSessionHint );
 
         var id = HandlerBase.GetString( args, "id" );
         List<GameObject> targets;
@@ -181,7 +184,7 @@ internal static class EditorHandler
 
     private static object GetPlayState()
     {
-        var session = SceneEditorSession.Active;
+        var session = SceneHelpers.ResolveSession();
         var state = session?.IsPlaying == true ? "playing" : "stopped";
         return HandlerBase.Success( new { playState = state } );
     }
@@ -190,8 +193,8 @@ internal static class EditorHandler
 
     private static object StartPlay()
     {
-        var session = SceneEditorSession.Active;
-        if ( session == null ) return HandlerBase.Error( "No editor session.", "start_play" );
+        var session = SceneHelpers.ResolveSession();
+        if ( session == null ) return HandlerBase.Error( "No editor session active.", "start_play", NoSessionHint );
         if ( session.IsPlaying ) return HandlerBase.Confirm( "Already playing." );
         session.SetPlaying( session.Scene );
         return HandlerBase.Confirm( "Play mode started." );
@@ -201,8 +204,8 @@ internal static class EditorHandler
 
     private static object StopPlay()
     {
-        var session = SceneEditorSession.Active;
-        if ( session == null ) return HandlerBase.Error( "No editor session.", "stop_play" );
+        var session = SceneHelpers.ResolveSession();
+        if ( session == null ) return HandlerBase.Error( "No editor session active.", "stop_play", NoSessionHint );
         if ( !session.IsPlaying ) return HandlerBase.Confirm( "Already stopped." );
         session.StopPlaying();
         return HandlerBase.Confirm( "Play mode stopped." );
@@ -238,8 +241,8 @@ internal static class EditorHandler
 
     private static object SaveScene()
     {
-        var session = SceneEditorSession.Active;
-        if ( session == null ) return HandlerBase.Error( "No editor session active.", "save_scene" );
+        var session = SceneHelpers.ResolveSession();
+        if ( session == null ) return HandlerBase.Error( "No editor session active.", "save_scene", NoSessionHint );
         session.Save( false );
 
         // Post-condition: file exists on disk with non-zero size, scene shows no unsaved changes.
@@ -283,8 +286,8 @@ internal static class EditorHandler
 
         HandlerBase.RequireAssetsPath( path, "save_scene_as" );
 
-        var session = SceneEditorSession.Active;
-        if ( session == null ) return HandlerBase.Error( "No editor session.", "save_scene_as" );
+        var session = SceneHelpers.ResolveSession();
+        if ( session == null ) return HandlerBase.Error( "No editor session active.", "save_scene_as", NoSessionHint );
 
         // The s&box Save(bool forceSaveAs) API opens a dialog — it doesn't accept a path.
         // We note this limitation in the response.
@@ -427,8 +430,8 @@ internal static class EditorHandler
 
     private static object Undo()
     {
-        var session = SceneEditorSession.Active;
-        if ( session == null ) return HandlerBase.Error( "No editor session active.", "undo" );
+        var session = SceneHelpers.ResolveSession();
+        if ( session == null ) return HandlerBase.Error( "No editor session active.", "undo", NoSessionHint );
         var us = session.UndoSystem;
         if ( us == null ) return HandlerBase.Error( "UndoSystem not available.", "undo" );
         us.Undo();
@@ -439,8 +442,8 @@ internal static class EditorHandler
 
     private static object Redo()
     {
-        var session = SceneEditorSession.Active;
-        if ( session == null ) return HandlerBase.Error( "No editor session active.", "redo" );
+        var session = SceneHelpers.ResolveSession();
+        if ( session == null ) return HandlerBase.Error( "No editor session active.", "redo", NoSessionHint );
         var us = session.UndoSystem;
         if ( us == null ) return HandlerBase.Error( "UndoSystem not available.", "redo" );
         us.Redo();
