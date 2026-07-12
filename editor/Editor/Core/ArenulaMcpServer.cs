@@ -36,7 +36,11 @@ public static class ArenulaMcpServer
     {
         try
         {
-            await GameTask.RunInThreadAsync( action );
+            // GameTask.RunInThreadAsync runs on a WORKER thread — Qt widget updates
+            // from there silently no-op, which left the panel's Activity Log empty.
+            // MainThread() is the real hop (same pattern as RpcDispatcher).
+            await GameTask.MainThread();
+            action();
         }
         catch { /* Main thread unavailable (cancelled / disposed) – safe to ignore */ }
     }
