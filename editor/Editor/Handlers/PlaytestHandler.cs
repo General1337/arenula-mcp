@@ -85,13 +85,13 @@ internal static class PlaytestHandler
 
         var results = new List<object>();
         foreach ( var assertion in doc.RootElement.EnumerateArray() )
-            results.Add( EvaluateAssertion( assertion ) );
+            results.Add( await EvaluateAssertion( assertion ) );
 
         var failed = results.Count( r => JsonSerializer.Serialize( r ).Contains( "\"pass\":false", StringComparison.OrdinalIgnoreCase ) );
         return HandlerBase.Success( new { overall = failed == 0 ? "pass" : "fail", assertion_count = results.Count, failed, results } );
     }
 
-    private static object EvaluateAssertion( JsonElement assertion )
+    private static async Task<object> EvaluateAssertion( JsonElement assertion )
     {
         var type = assertion.GetProperty( "type" ).GetString();
         return type switch
@@ -100,7 +100,7 @@ internal static class PlaytestHandler
             "log_contains" => EvaluateLogAssertion( assertion, true ),
             "log_not_contains" => EvaluateLogAssertion( assertion, false ),
             "scene_find" => EvaluateSceneFindAssertion( assertion ),
-            "console_command" => EvaluateConsoleAssertion( assertion ),
+            "console_command" => await EvaluateConsoleAssertion( assertion ),
             _ => new { type, pass = false, message = "Unsupported assertion type." }
         };
     }
@@ -128,10 +128,10 @@ internal static class PlaytestHandler
         return new { type = "scene_find", query, pass };
     }
 
-    private static object EvaluateConsoleAssertion( JsonElement assertion )
+    private static async Task<object> EvaluateConsoleAssertion( JsonElement assertion )
     {
         var command = assertion.GetProperty( "command" ).GetString();
-        var result = ConsoleHandler.HandleAsync( "console_run", BuildArgs( new { action = "console_run", command, wait_ms = 250 } ) ).GetAwaiter().GetResult();
+        var result = await ConsoleHandler.HandleAsync( "console_run", BuildArgs( new { action = "console_run", command, wait_ms = 250 } ) );
         var mustContain = assertion.TryGetProperty( "contains", out var containsEl ) ? containsEl.GetString() : null;
         var json = JsonSerializer.Serialize( result );
         var pass = string.IsNullOrEmpty( mustContain ) || json.Contains( mustContain, StringComparison.OrdinalIgnoreCase );

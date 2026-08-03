@@ -70,7 +70,8 @@ internal static class MaterialHelper
             var faceHandle = mesh.FaceHandleFromIndex( faceIndex );
             if ( !faceHandle.IsValid )
                 return false;
-            mesh.SetFaceTextureParameters( faceHandle, vAxisU, vAxisV, scale );
+            mesh.SetFaceTextureParameters( faceHandle,
+                new Vector4( vAxisU, 0f ), new Vector4( vAxisV, 0f ), scale );
             return true;
         }
         catch

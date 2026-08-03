@@ -1156,7 +1156,8 @@ internal static class MeshHandler
         else
         {
             foreach ( var hFace in mesh.FaceHandles )
-                mesh.SetFaceTextureParameters( hFace, vAxisU, vAxisV, scale );
+                mesh.SetFaceTextureParameters( hFace,
+                    new Vector4( vAxisU, 0f ), new Vector4( vAxisV, 0f ), scale );
         }
 
         return HandlerBase.Confirm( faceIndex >= 0
