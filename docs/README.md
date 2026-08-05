@@ -19,4 +19,4 @@ node dist/index.js
 |---|---|
 | `sbox_docs_search` | Search indexed doc pages by keyword |
 | `sbox_docs_get_page` | Fetch any docs.facepunch.com URL as Markdown |
-| `sbox_api_get_type` | Fetch API type docs from Facepunch docs |
+| `sbox_docs_list` | Browse the s&box docs table of contents by category |

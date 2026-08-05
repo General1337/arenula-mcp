@@ -2,10 +2,10 @@
 
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js'
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js'
-import { SearchDocsInput, GetPageInput, GetApiTypeInput } from './schemas/index.js'
+import { SearchDocsInput, GetPageInput, ListDocsInput } from './schemas/index.js'
 import { searchDocs } from './tools/search-docs.js'
 import { getPage } from './tools/get-page.js'
-import { getApiType } from './tools/get-api-type.js'
+import { listDocs } from './tools/list-docs.js'
 
 const server = new McpServer({
   name: 'Arenula Docs',
@@ -33,11 +33,11 @@ server.tool(
 )
 
 server.tool(
-  'sbox_api_get_type',
-  'Get API documentation for a specific s&box type, class, or struct. Returns properties, methods, and descriptions.',
-  GetApiTypeInput.shape,
+  'sbox_docs_list',
+  'Browse the s&box documentation table of contents. Lists pages by category. Call with no arguments for a category overview.',
+  ListDocsInput.shape,
   async (params) => {
-    const text = await getApiType(params)
+    const text = await listDocs(params)
     return { content: [{ type: 'text', text }] }
   },
 )
