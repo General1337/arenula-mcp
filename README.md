@@ -139,4 +139,5 @@ Tools appear as `mcp__editor__*`, `mcp__api__*`, `mcp__docs__*` in your AI clien
 
 ## License
 
-GPL-3.0 (Editor) · MIT (API, Docs)
+GPL-3.0 (Editor) · MIT (API, Docs, schemagen) — see [`LICENSE`](LICENSE) for why the split
+exists and which one applies to code you copy.

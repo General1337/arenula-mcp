@@ -1,0 +1,26 @@
+Arenula MCP is licensed per component, not as a single work. There is no one
+license covering this repository, which is why this file points at the three
+that actually apply rather than declaring a fourth.
+
+    editor/     GPL-3.0-only   see editor/LICENSE
+    api/        MIT            see api/LICENSE
+    docs/       MIT            see docs/LICENSE
+    schemagen/  MIT            see schemagen/LICENSE
+
+The split is deliberate and not merely historical. The editor plugin is a
+derivative of the Ozmium MCP Server for s&box (https://github.com/ozmium7/
+ozmium-mcp-server-for-sbox), which is GPL-3.0, so the editor component
+inherits GPL-3.0 and cannot be relicensed. The API and docs servers derive
+from sbox-api-mcp and sbox-docs-mcp by sofianebel, both MIT, and stay MIT.
+
+The schemagen/ sidecar is original work with no upstream to inherit from, so
+it is MIT: it is a standalone .NET reflector, useful independently of the
+editor plugin that invokes it.
+
+If you vendor part of this repository, take the license of the directory you
+copied from. Copying the editor into an MIT project does not make it MIT.
+
+Contributions are licensed under the license of the component being modified;
+see CONTRIBUTING.md.
+
+Copyright (c) 2026 Nyx000
