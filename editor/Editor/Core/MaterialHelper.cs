@@ -59,8 +59,20 @@ internal static class MaterialHelper
         return ApplyMaterialToFace( mesh, faceIndex, material );
     }
 
+    /// <summary>
+    /// Set a face's texture projection parameters. Mirrors
+    /// <c>PolygonMesh.SetFaceTextureParameters</c> argument-for-argument on purpose:
+    /// the axes arrive already packed as Vector4, with the texture offset in the w
+    /// components (axisU.w -> offset.x, axisV.w -> offset.y).
+    ///
+    /// Do not "simplify" this to take Vector3 axes plus a separate Vector2 offset.
+    /// Vector2 and Vector3 convert into each other implicitly in s&amp;box, so that shape
+    /// lets a misordered call compile and silently write each value into the wrong slot
+    /// — which is exactly what happened here between 2026-04-04 and 2026-08-15. Vector3
+    /// -> Vector4 is explicit, so this signature rejects the same mistake at compile time.
+    /// </summary>
     internal static bool SetTextureParameters( PolygonMesh mesh, int faceIndex,
-        Vector3 vAxisU, Vector3 vAxisV, Vector2 scale )
+        Vector4 axisU, Vector4 axisV, Vector2 scale )
     {
         if ( mesh == null )
             return false;
@@ -69,7 +81,7 @@ internal static class MaterialHelper
             var faceHandle = mesh.FaceHandleFromIndex( faceIndex );
             if ( !faceHandle.IsValid )
                 return false;
-            mesh.SetFaceTextureParameters( faceHandle, vAxisU, vAxisV, scale );
+            mesh.SetFaceTextureParameters( faceHandle, axisU, axisV, scale );
             return true;
         }
         catch

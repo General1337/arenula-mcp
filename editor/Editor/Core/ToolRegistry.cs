@@ -275,9 +275,10 @@ internal static class ToolRegistry
                 ["must_be_planar"] = new { type = "boolean", description = "Require planar faces for dissolve. Used by: dissolve_edges. Default: false." },
                 ["color"] = new { type = "string", description = "Color as 'r,g,b,a'. Required for: set_vertex_color." },
                 ["blend"] = new { type = "number", description = "Blend weight 0-1. Required for: set_vertex_blend." },
-                ["offset"] = new { type = "string", description = "Texture offset as 'u,v'. Used by: set_texture_params." },
-                ["scale"] = new { type = "string", description = "Texture scale as 'u,v'. Used by: set_texture_params." },
-                ["rotation"] = new { type = "number", description = "Texture rotation degrees. Used by: set_texture_params." }
+                ["u_axis"] = new { type = "string", description = "Texture U projection axis as 'x,y,z'. Used by: set_texture_params. Default: '1,0,0'." },
+                ["v_axis"] = new { type = "string", description = "Texture V projection axis as 'x,y,z'. Used by: set_texture_params. Default: '0,0,1'." },
+                ["offset"] = new { type = "string", description = "Texture offset as 'u,v'. Used by: set_texture_params. Default: '0,0'." },
+                ["scale"] = new { type = "string", description = "Texture scale as 'u,v'. Used by: set_texture_params. Default: '1,1'." }
             },
             required = new[] { "action" },
             additionalProperties = false

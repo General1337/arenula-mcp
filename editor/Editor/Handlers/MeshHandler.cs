@@ -1092,29 +1092,31 @@ internal static class MeshHandler
         // Parse UV axis vectors from "x,y,z" strings or use defaults
         var uAxisStr = HandlerBase.GetString( args, "u_axis" );
         var vAxisStr = HandlerBase.GetString( args, "v_axis" );
-        var vAxisU = uAxisStr != null ? HandlerBase.ParseVector3( uAxisStr ) : new Vector3( 1, 0, 0 );
-        var vAxisV = vAxisStr != null ? HandlerBase.ParseVector3( vAxisStr ) : new Vector3( 0, 0, 1 );
+        var uAxis = uAxisStr != null ? HandlerBase.ParseVector3( uAxisStr ) : new Vector3( 1, 0, 0 );
+        var vAxis = vAxisStr != null ? HandlerBase.ParseVector3( vAxisStr ) : new Vector3( 0, 0, 1 );
+
+        var offsetStr = HandlerBase.GetString( args, "offset" );
+        var offset = offsetStr != null ? HandlerBase.ParseVector2( offsetStr ) : new Vector2( 0, 0 );
 
         var scaleStr = HandlerBase.GetString( args, "scale" );
-        Vector2 scale;
-        if ( scaleStr != null )
-        {
-            scale = HandlerBase.ParseVector2( scaleStr );
-        }
-        else
-        {
-            scale = new Vector2( 1, 1 );
-        }
+        var scale = scaleStr != null ? HandlerBase.ParseVector2( scaleStr ) : new Vector2( 1, 1 );
+
+        // The engine carries the texture offset in the w component of each axis, not as a
+        // separate argument: SetFaceTextureParameters assigns axisU.w -> TextureOffset.x
+        // and axisV.w -> TextureOffset.y. Pack it here, where the parsed names are still
+        // in view, rather than anywhere further down.
+        var axisU = new Vector4( uAxis, offset.x );
+        var axisV = new Vector4( vAxis, offset.y );
 
         if ( faceIndex >= 0 )
         {
-            if ( !MaterialHelper.SetTextureParameters( mesh, faceIndex, vAxisU, vAxisV, scale ) )
+            if ( !MaterialHelper.SetTextureParameters( mesh, faceIndex, axisU, axisV, scale ) )
                 return HandlerBase.Error( $"Invalid face index {faceIndex}.", "set_texture_params" );
         }
         else
         {
             foreach ( var hFace in mesh.FaceHandles )
-                mesh.SetFaceTextureParameters( hFace, vAxisU, vAxisV, scale );
+                mesh.SetFaceTextureParameters( hFace, axisU, axisV, scale );
         }
 
         return HandlerBase.Confirm( faceIndex >= 0
