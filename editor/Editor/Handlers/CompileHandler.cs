@@ -164,7 +164,7 @@ internal static class CompileHandler
     /// <summary>
     /// Return compiler diagnostics (errors/warnings) from the last build.
     /// Supports optional severity filter: "error", "warning", "info", "hidden".
-    /// Microsoft.CodeAnalysis.Diagnostic is available because s&box ships Roslyn for its compiler.
+    /// Microsoft.CodeAnalysis.Diagnostic is available because s&amp;box ships Roslyn for its compiler.
     /// </summary>
     private static async Task<object> GetErrors( JsonElement args )
     {

@@ -145,7 +145,14 @@ internal static class TraceHandler
             start_position = HandlerBase.V3( r.StartPosition ),
             end_position = HandlerBase.V3( r.EndPosition ),
             surface = r.Surface?.ResourceName,
+            // SceneTraceResult.Tags is [Obsolete("Use HasTag instead")], but HasTag only
+            // TESTS one tag — there is no non-obsolete way to ENUMERATE them, and this
+            // response has to return the whole set because the caller does not know which
+            // tags to ask about. Suppressed deliberately rather than silently narrowed.
+            // Revisit if the engine ever exposes an enumerable replacement.
+#pragma warning disable CS0618
             tags = r.Tags,
+#pragma warning restore CS0618
             @object = r.GameObject != null ? new { id = r.GameObject.Id.ToString(), name = r.GameObject.Name } : null,
             component_type = r.Component?.GetType().Name
         };
