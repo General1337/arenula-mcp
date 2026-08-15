@@ -55,9 +55,15 @@ internal static class Program
 		var sw = Stopwatch.StartNew();
 		var startedAt = DateTime.UtcNow;
 
-		var dlls = Directory.GetFiles(managedDir, "Sandbox.*.dll");
+		// The engine surface spans two assembly families. Globbing Sandbox.* alone drops
+		// ~110 Facepunch.ActionGraphs types, which reads downstream as "they don't exist".
+		var dlls = Directory.GetFiles(managedDir, "Sandbox.*.dll")
+			.Concat(Directory.GetFiles(managedDir, "Facepunch.*.dll"))
+			.OrderBy(p => p, StringComparer.OrdinalIgnoreCase)
+			.ToArray();
 		if (dlls.Length == 0)
-			throw new InvalidOperationException($"No Sandbox.*.dll files found in {managedDir}");
+			throw new InvalidOperationException(
+				$"No Sandbox.*.dll or Facepunch.*.dll files found in {managedDir}");
 
 		var enginePath = dlls.FirstOrDefault(p =>
 			string.Equals(Path.GetFileName(p), "Sandbox.Engine.dll", StringComparison.OrdinalIgnoreCase))
