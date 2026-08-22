@@ -9,7 +9,6 @@ namespace Arenula;
 
 /// <summary>
 /// gameobject tool: create, destroy, duplicate, reparent, rename, enable, set_tags, set_transform, batch_transform.
-/// Ported from Ozmium OzmiumWriteHandlers + UtilityToolHandlers.BatchTransform.
 /// </summary>
 internal static class GameObjectHandler
 {
@@ -44,9 +43,7 @@ internal static class GameObjectHandler
 
     private static object Create( JsonElement args )
     {
-        var scene = SceneHelpers.ResolveScene();
-        if ( scene == null )
-            return HandlerBase.Error( "No active scene.", "create" );
+        var scene = HandlerBase.RequireScene( "create" );
 
         var name = HandlerBase.GetString( args, "name", "New GameObject" );
         var parentId = HandlerBase.GetString( args, "parent_id" );
@@ -82,9 +79,7 @@ internal static class GameObjectHandler
 
     private static object Destroy( JsonElement args )
     {
-        var scene = SceneHelpers.ResolveScene();
-        if ( scene == null )
-            return HandlerBase.Error( "No active scene.", "destroy" );
+        var scene = HandlerBase.RequireScene( "destroy" );
 
         // Support bulk destroy by name (e.g. destroy all "info_player_start" under a parent)
         var name = HandlerBase.GetString( args, "name" );
@@ -250,9 +245,7 @@ internal static class GameObjectHandler
 
     private static object Duplicate( JsonElement args )
     {
-        var scene = SceneHelpers.ResolveScene();
-        if ( scene == null )
-            return HandlerBase.Error( "No active scene.", "duplicate" );
+        var scene = HandlerBase.RequireScene( "duplicate" );
 
         var id = HandlerBase.GetString( args, "id" );
         if ( string.IsNullOrEmpty( id ) )
@@ -276,9 +269,7 @@ internal static class GameObjectHandler
 
     private static object Reparent( JsonElement args )
     {
-        var scene = SceneHelpers.ResolveScene();
-        if ( scene == null )
-            return HandlerBase.Error( "No active scene.", "reparent" );
+        var scene = HandlerBase.RequireScene( "reparent" );
 
         var id = HandlerBase.GetString( args, "id" );
         if ( string.IsNullOrEmpty( id ) )
@@ -306,9 +297,7 @@ internal static class GameObjectHandler
 
     private static object Rename( JsonElement args )
     {
-        var scene = SceneHelpers.ResolveScene();
-        if ( scene == null )
-            return HandlerBase.Error( "No active scene.", "rename" );
+        var scene = HandlerBase.RequireScene( "rename" );
 
         var id = HandlerBase.GetString( args, "id" );
         if ( string.IsNullOrEmpty( id ) )
@@ -329,9 +318,7 @@ internal static class GameObjectHandler
 
     private static object Enable( JsonElement args )
     {
-        var scene = SceneHelpers.ResolveScene();
-        if ( scene == null )
-            return HandlerBase.Error( "No active scene.", "enable" );
+        var scene = HandlerBase.RequireScene( "enable" );
 
         var id = HandlerBase.GetString( args, "id" );
         if ( string.IsNullOrEmpty( id ) )
@@ -351,9 +338,7 @@ internal static class GameObjectHandler
 
     private static object SetTags( JsonElement args )
     {
-        var scene = SceneHelpers.ResolveScene();
-        if ( scene == null )
-            return HandlerBase.Error( "No active scene.", "set_tags" );
+        var scene = HandlerBase.RequireScene( "set_tags" );
 
         var id = HandlerBase.GetString( args, "id" );
         if ( string.IsNullOrEmpty( id ) )
@@ -377,9 +362,7 @@ internal static class GameObjectHandler
 
     private static object SetTransform( JsonElement args )
     {
-        var scene = SceneHelpers.ResolveScene();
-        if ( scene == null )
-            return HandlerBase.Error( "No active scene.", "set_transform" );
+        var scene = HandlerBase.RequireScene( "set_transform" );
 
         var id = HandlerBase.GetString( args, "id" );
         if ( string.IsNullOrEmpty( id ) )
@@ -431,9 +414,7 @@ internal static class GameObjectHandler
 
     private static object BatchTransform( JsonElement args )
     {
-        var scene = SceneHelpers.ResolveScene();
-        if ( scene == null )
-            return HandlerBase.Error( "No active scene.", "batch_transform" );
+        var scene = HandlerBase.RequireScene( "batch_transform" );
 
         var idsStr = HandlerBase.GetString( args, "ids" );
         if ( string.IsNullOrEmpty( idsStr ) )

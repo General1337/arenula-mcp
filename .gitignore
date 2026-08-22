@@ -1,6 +1,8 @@
 node_modules/
 dist/
 *.js.map
+obj/
+bin/
 .DS_Store
 Thumbs.db
 .env
@@ -14,3 +16,10 @@ editor/.vscode/
 editor/ProjectSettings/
 test/
 .superpowers/
+CLAUDE.md
+context/
+docs/superpowers/
+
+schemagen/bin/
+schemagen/obj/
+

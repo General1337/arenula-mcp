@@ -12,7 +12,6 @@ namespace Arenula;
 /// effects tool: create, configure_particle, configure_post_processing.
 /// Consolidates Ozmium CreateParticleEffect, CreateFogVolume, CreateBeamEffect,
 /// CreateVerletRope, CreateRadiusDamage, CreateRenderEntity into 'create' with type param.
-/// Ported from EffectToolHandlers.cs (641 lines, minus CreateJoint moved to physics).
 /// </summary>
 internal static class EffectsHandler
 {
@@ -22,11 +21,14 @@ internal static class EffectsHandler
         {
             return action switch
             {
-                "create"                   => Create( args ),
-                "configure_particle"       => ConfigureParticle( args ),
+                "create"                    => Create( args ),
+                "configure_particle"        => ConfigureParticle( args ),
                 "configure_post_processing" => ConfigurePostProcessing( args ),
+                "configure_sprite"          => ConfigureSprite( args ),
+                "configure_prop"            => ConfigureProp( args ),
+                "configure_world_panel"     => ConfigureWorldPanel( args ),
                 _ => HandlerBase.Error( $"Unknown action '{action}'", action,
-                    "Valid actions: create, configure_particle, configure_post_processing" )
+                    "Valid actions: create, configure_particle, configure_post_processing, configure_sprite, configure_prop, configure_world_panel" )
             };
         }
         catch ( Exception ex )
@@ -41,9 +43,7 @@ internal static class EffectsHandler
 
     private static object Create( JsonElement args )
     {
-        var scene = SceneHelpers.ResolveScene();
-        if ( scene == null )
-            return HandlerBase.Error( "No active scene.", "create" );
+        var scene = HandlerBase.RequireScene( "create" );
 
         var type = HandlerBase.GetString( args, "type", "particle" );
         var posStr = HandlerBase.GetString( args, "position" );
@@ -57,27 +57,25 @@ internal static class EffectsHandler
             "rope"           => CreateRope( scene, args, position ),
             "radius_damage"  => CreateRadiusDamage( scene, args, position ),
             "render_entity"  => CreateRenderEntity( scene, args, position ),
+            "sprite"         => CreateSprite( scene, args, position ),
+            "prop"           => CreateProp( scene, args, position ),
+            "world_panel"    => CreateWorldPanel( scene, args, position ),
             _ => HandlerBase.Error(
                 $"Unknown effect type '{type}'.",
                 "create",
-                "Valid types: particle, fog, beam, rope, radius_damage, render_entity" )
+                "Valid types: particle, fog, beam, rope, radius_damage, render_entity, sprite, prop, world_panel" )
         };
     }
 
     private static object CreateParticle( Scene scene, JsonElement args, Vector3 position )
     {
-        var go = scene.CreateObject();
-        go.Name = HandlerBase.GetString( args, "name" ) ?? "Particle Effect";
-        go.WorldPosition = position;
+        var go = SceneHelpers.CreateChildObject( scene, args, "Particle Effect", position );
 
         var pe = go.Components.Create<ParticleEffect>();
         pe.MaxParticles = HandlerBase.GetInt( args, "max_particles", 1000 );
-        if ( args.TryGetProperty( "lifetime", out var ltEl ) && ltEl.ValueKind == JsonValueKind.Number )
-            pe.Lifetime = ltEl.GetSingle();
-        if ( args.TryGetProperty( "time_scale", out var tsEl ) && tsEl.ValueKind == JsonValueKind.Number )
-            pe.TimeScale = tsEl.GetSingle();
-        if ( args.TryGetProperty( "pre_warm", out var pwEl ) && pwEl.ValueKind == JsonValueKind.Number )
-            pe.PreWarm = pwEl.GetSingle();
+        if ( HandlerBase.TryGetFloat( args, "lifetime", out var lt ) ) pe.Lifetime = lt;
+        if ( HandlerBase.TryGetFloat( args, "time_scale", out var ts ) ) pe.TimeScale = ts;
+        if ( HandlerBase.TryGetFloat( args, "pre_warm", out var pw ) ) pe.PreWarm = pw;
 
         return HandlerBase.Success( new
         {
@@ -90,40 +88,27 @@ internal static class EffectsHandler
 
     private static object CreateFog( Scene scene, JsonElement args, Vector3 position )
     {
-        var go = scene.CreateObject();
-        go.Name = HandlerBase.GetString( args, "name" ) ?? "Fog Volume";
-        go.WorldPosition = position;
+        var go = SceneHelpers.CreateChildObject( scene, args, "Fog Volume", position );
 
         var fogType = HandlerBase.GetString( args, "fog_type", "gradient" );
 
         if ( fogType.Equals( "volumetric", StringComparison.OrdinalIgnoreCase ) )
         {
             var vf = go.Components.Create<VolumetricFogVolume>();
-            if ( args.TryGetProperty( "strength", out var sEl ) && sEl.ValueKind == JsonValueKind.Number )
-                vf.Strength = sEl.GetSingle();
-            if ( args.TryGetProperty( "falloff_exponent", out var feEl ) && feEl.ValueKind == JsonValueKind.Number )
-                vf.FalloffExponent = feEl.GetSingle();
+            if ( HandlerBase.TryGetFloat( args, "strength", out var s ) ) vf.Strength = s;
+            if ( HandlerBase.TryGetFloat( args, "falloff_exponent", out var fe ) ) vf.FalloffExponent = fe;
             vf.Bounds = BBox.FromPositionAndSize( 0, 300 );
         }
         else
         {
             var gf = go.Components.Create<GradientFog>();
             gf.Color = Color.White;
-            if ( args.TryGetProperty( "height", out var hEl ) && hEl.ValueKind == JsonValueKind.Number )
-                gf.Height = hEl.GetSingle();
-            if ( args.TryGetProperty( "start_distance", out var sdEl ) && sdEl.ValueKind == JsonValueKind.Number )
-                gf.StartDistance = sdEl.GetSingle();
-            if ( args.TryGetProperty( "end_distance", out var edEl ) && edEl.ValueKind == JsonValueKind.Number )
-                gf.EndDistance = edEl.GetSingle();
-            if ( args.TryGetProperty( "falloff_exponent", out var feEl ) && feEl.ValueKind == JsonValueKind.Number )
-                gf.FalloffExponent = feEl.GetSingle();
-            if ( args.TryGetProperty( "vertical_falloff_exponent", out var vfeEl ) && vfeEl.ValueKind == JsonValueKind.Number )
-                gf.VerticalFalloffExponent = vfeEl.GetSingle();
-            var colorStr = HandlerBase.GetString( args, "color" );
-            if ( !string.IsNullOrEmpty( colorStr ) )
-            {
-                try { gf.Color = Color.Parse( colorStr ) ?? default; } catch { }
-            }
+            if ( HandlerBase.TryGetFloat( args, "height", out var h ) ) gf.Height = h;
+            if ( HandlerBase.TryGetFloat( args, "start_distance", out var sd ) ) gf.StartDistance = sd;
+            if ( HandlerBase.TryGetFloat( args, "end_distance", out var ed ) ) gf.EndDistance = ed;
+            if ( HandlerBase.TryGetFloat( args, "falloff_exponent", out var fe ) ) gf.FalloffExponent = fe;
+            if ( HandlerBase.TryGetFloat( args, "vertical_falloff_exponent", out var vfe ) ) gf.VerticalFalloffExponent = vfe;
+            HandlerBase.ApplyColor( args, "color", c => gf.Color = c );
         }
 
         return HandlerBase.Success( new
@@ -137,15 +122,11 @@ internal static class EffectsHandler
 
     private static object CreateBeam( Scene scene, JsonElement args, Vector3 position )
     {
-        var go = scene.CreateObject();
-        go.Name = HandlerBase.GetString( args, "name" ) ?? "Beam Effect";
-        go.WorldPosition = position;
+        var go = SceneHelpers.CreateChildObject( scene, args, "Beam Effect", position );
 
         var beam = go.Components.Create<BeamEffect>();
-        if ( args.TryGetProperty( "scale", out var scEl ) && scEl.ValueKind == JsonValueKind.Number )
-            beam.Scale = scEl.GetSingle();
-        if ( args.TryGetProperty( "beams_per_second", out var bpsEl ) && bpsEl.ValueKind == JsonValueKind.Number )
-            beam.BeamsPerSecond = bpsEl.GetSingle();
+        if ( HandlerBase.TryGetFloat( args, "scale", out var sc ) ) beam.Scale = sc;
+        if ( HandlerBase.TryGetFloat( args, "beams_per_second", out var bps ) ) beam.BeamsPerSecond = bps;
         beam.MaxBeams = HandlerBase.GetInt( args, "max_beams", 1 );
         beam.Looped = HandlerBase.GetBool( args, "looped", false );
 
@@ -154,11 +135,7 @@ internal static class EffectsHandler
             beam.TargetPosition = HandlerBase.ParseVector3( targetPosStr );
 
         var targetId = HandlerBase.GetString( args, "target_id" );
-        if ( !string.IsNullOrEmpty( targetId ) )
-        {
-            var targetGo = SceneHelpers.FindById( scene, targetId );
-            if ( targetGo != null ) beam.TargetGameObject = targetGo;
-        }
+        beam.TargetGameObject = HandlerBase.ResolveGameObjectById( scene, targetId, "create_beam" );
 
         return HandlerBase.Success( new
         {
@@ -171,27 +148,17 @@ internal static class EffectsHandler
 
     private static object CreateRope( Scene scene, JsonElement args, Vector3 position )
     {
-        var go = scene.CreateObject();
-        go.Name = HandlerBase.GetString( args, "name" ) ?? "Verlet Rope";
-        go.WorldPosition = position;
+        var go = SceneHelpers.CreateChildObject( scene, args, "Verlet Rope", position );
 
         var rope = go.Components.Create<VerletRope>();
         rope.SegmentCount = HandlerBase.GetInt( args, "segment_count", 16 );
-        if ( args.TryGetProperty( "slack", out var slEl ) && slEl.ValueKind == JsonValueKind.Number )
-            rope.Slack = slEl.GetSingle();
-        if ( args.TryGetProperty( "radius", out var rEl ) && rEl.ValueKind == JsonValueKind.Number )
-            rope.Radius = rEl.GetSingle();
-        if ( args.TryGetProperty( "stiffness", out var stEl ) && stEl.ValueKind == JsonValueKind.Number )
-            rope.Stiffness = stEl.GetSingle();
-        if ( args.TryGetProperty( "damping_factor", out var dfEl ) && dfEl.ValueKind == JsonValueKind.Number )
-            rope.DampingFactor = dfEl.GetSingle();
+        if ( HandlerBase.TryGetFloat( args, "slack", out var sl ) ) rope.Slack = sl;
+        if ( HandlerBase.TryGetFloat( args, "radius", out var r ) ) rope.Radius = r;
+        if ( HandlerBase.TryGetFloat( args, "stiffness", out var st ) ) rope.Stiffness = st;
+        if ( HandlerBase.TryGetFloat( args, "damping_factor", out var df ) ) rope.DampingFactor = df;
 
         var attachId = HandlerBase.GetString( args, "attachment_id" );
-        if ( !string.IsNullOrEmpty( attachId ) )
-        {
-            var attachGo = SceneHelpers.FindById( scene, attachId );
-            if ( attachGo != null ) rope.Attachment = attachGo;
-        }
+        rope.Attachment = HandlerBase.ResolveGameObjectById( scene, attachId, "create_rope" );
 
         return HandlerBase.Success( new
         {
@@ -204,17 +171,12 @@ internal static class EffectsHandler
 
     private static object CreateRadiusDamage( Scene scene, JsonElement args, Vector3 position )
     {
-        var go = scene.CreateObject();
-        go.Name = HandlerBase.GetString( args, "name" ) ?? "Radius Damage";
-        go.WorldPosition = position;
+        var go = SceneHelpers.CreateChildObject( scene, args, "Radius Damage", position );
 
         var rd = go.Components.Create<RadiusDamage>();
-        if ( args.TryGetProperty( "radius", out var rEl ) && rEl.ValueKind == JsonValueKind.Number )
-            rd.Radius = rEl.GetSingle();
-        if ( args.TryGetProperty( "damage_amount", out var daEl ) && daEl.ValueKind == JsonValueKind.Number )
-            rd.DamageAmount = daEl.GetSingle();
-        if ( args.TryGetProperty( "physics_force_scale", out var pfsEl ) && pfsEl.ValueKind == JsonValueKind.Number )
-            rd.PhysicsForceScale = pfsEl.GetSingle();
+        if ( HandlerBase.TryGetFloat( args, "radius", out var r ) ) rd.Radius = r;
+        if ( HandlerBase.TryGetFloat( args, "damage_amount", out var da ) ) rd.DamageAmount = da;
+        if ( HandlerBase.TryGetFloat( args, "physics_force_scale", out var pfs ) ) rd.PhysicsForceScale = pfs;
         rd.DamageOnEnabled = HandlerBase.GetBool( args, "damage_on_enabled", true );
         rd.Occlusion = HandlerBase.GetBool( args, "occlusion", true );
 
@@ -242,9 +204,7 @@ internal static class EffectsHandler
         // Supports: text, line, sprite, trail, model_renderer, skinned_model, screen_panel
         var renderType = HandlerBase.GetString( args, "render_type", "" );
 
-        var go = scene.CreateObject();
-        go.Name = HandlerBase.GetString( args, "name" ) ?? "Render Entity";
-        go.WorldPosition = position;
+        var go = SceneHelpers.CreateChildObject( scene, args, "Render Entity", position );
 
         switch ( renderType.ToLowerInvariant() )
         {
@@ -252,11 +212,7 @@ internal static class EffectsHandler
             {
                 var tr = go.Components.Create<TextRenderer>();
                 tr.Text = HandlerBase.GetString( args, "text", tr.Text );
-                var colorStr = HandlerBase.GetString( args, "color" );
-                if ( !string.IsNullOrEmpty( colorStr ) )
-                {
-                    try { tr.Color = Color.Parse( colorStr ) ?? default; } catch { }
-                }
+                HandlerBase.ApplyColor( args, "color", c => tr.Color = c );
                 break;
             }
             case "trail":
@@ -273,29 +229,22 @@ internal static class EffectsHandler
             {
                 var mr = go.Components.Create<ModelRenderer>();
                 var modelPath = HandlerBase.GetString( args, "model_path" );
-                if ( !string.IsNullOrEmpty( modelPath ) )
-                {
-                    var model = Model.Load( modelPath );
-                    if ( model != null ) mr.Model = model;
-                }
+                var resolvedModel = HandlerBase.ResolveModel( modelPath, "create_effect" );
+                if ( resolvedModel != null ) mr.Model = resolvedModel;
                 break;
             }
             case "skinned_model":
             {
                 var sk = go.Components.Create<SkinnedModelRenderer>();
                 var modelPath = HandlerBase.GetString( args, "model_path" );
-                if ( !string.IsNullOrEmpty( modelPath ) )
-                {
-                    var model = Model.Load( modelPath );
-                    if ( model != null ) sk.Model = model;
-                }
+                var resolvedModel = HandlerBase.ResolveModel( modelPath, "create_effect" );
+                if ( resolvedModel != null ) sk.Model = resolvedModel;
                 break;
             }
             case "screen_panel":
             {
                 var sp = go.Components.Create<ScreenPanel>();
-                if ( args.TryGetProperty( "opacity", out var opEl ) && opEl.ValueKind == JsonValueKind.Number )
-                    sp.Opacity = opEl.GetSingle();
+                if ( HandlerBase.TryGetFloat( args, "opacity", out var op ) ) sp.Opacity = op;
                 break;
             }
             default:
@@ -316,13 +265,10 @@ internal static class EffectsHandler
     }
 
     // ── configure_particle ────────────────────────────────────────────
-    // Ported from EffectToolHandlers.ConfigureParticleEffect
 
     private static object ConfigureParticle( JsonElement args )
     {
-        var scene = SceneHelpers.ResolveScene();
-        if ( scene == null )
-            return HandlerBase.Error( "No active scene.", "configure_particle" );
+        var scene = HandlerBase.RequireScene( "configure_particle" );
 
         var id = HandlerBase.GetString( args, "id" );
         if ( string.IsNullOrEmpty( id ) )
@@ -333,26 +279,19 @@ internal static class EffectsHandler
         if ( pe == null )
             return HandlerBase.Error( $"No ParticleEffect component found on '{go.Name}'.", "configure_particle" );
 
-        if ( args.TryGetProperty( "max_particles", out var mpEl ) && mpEl.ValueKind == JsonValueKind.Number )
-            pe.MaxParticles = mpEl.GetInt32();
-        if ( args.TryGetProperty( "lifetime", out var ltEl ) && ltEl.ValueKind == JsonValueKind.Number )
-            pe.Lifetime = ltEl.GetSingle();
-        if ( args.TryGetProperty( "time_scale", out var tsEl ) && tsEl.ValueKind == JsonValueKind.Number )
-            pe.TimeScale = tsEl.GetSingle();
-        if ( args.TryGetProperty( "pre_warm", out var pwEl ) && pwEl.ValueKind == JsonValueKind.Number )
-            pe.PreWarm = pwEl.GetSingle();
+        if ( HandlerBase.TryGetInt( args, "max_particles", out var mp ) ) pe.MaxParticles = mp;
+        if ( HandlerBase.TryGetFloat( args, "lifetime", out var lt ) ) pe.Lifetime = lt;
+        if ( HandlerBase.TryGetFloat( args, "time_scale", out var ts ) ) pe.TimeScale = ts;
+        if ( HandlerBase.TryGetFloat( args, "pre_warm", out var pw ) ) pe.PreWarm = pw;
 
         return HandlerBase.Confirm( $"Configured ParticleEffect on '{go.Name}'." );
     }
 
     // ── configure_post_processing ─────────────────────────────────────
-    // Ported from EffectToolHandlers.ConfigurePostProcessing
 
     private static object ConfigurePostProcessing( JsonElement args )
     {
-        var scene = SceneHelpers.ResolveScene();
-        if ( scene == null )
-            return HandlerBase.Error( "No active scene.", "configure_post_processing" );
+        var scene = HandlerBase.RequireScene( "configure_post_processing" );
 
         var id = HandlerBase.GetString( args, "id" );
         if ( string.IsNullOrEmpty( id ) )
@@ -366,12 +305,264 @@ internal static class EffectsHandler
             pp = go.Components.Create<PostProcessVolume>();
 
         pp.Priority = HandlerBase.GetInt( args, "priority", pp.Priority );
-        if ( args.TryGetProperty( "blend_weight", out var bwEl ) && bwEl.ValueKind == JsonValueKind.Number )
-            pp.BlendWeight = bwEl.GetSingle();
-        if ( args.TryGetProperty( "blend_distance", out var bdEl ) && bdEl.ValueKind == JsonValueKind.Number )
-            pp.BlendDistance = bdEl.GetSingle();
+        if ( HandlerBase.TryGetFloat( args, "blend_weight", out var bw ) ) pp.BlendWeight = bw;
+        if ( HandlerBase.TryGetFloat( args, "blend_distance", out var bd ) ) pp.BlendDistance = bd;
         pp.EditorPreview = HandlerBase.GetBool( args, "editor_preview", pp.EditorPreview );
 
         return HandlerBase.Confirm( $"Configured PostProcessVolume on '{go.Name}'." );
+    }
+
+    // ── CreateSprite ─────────────────────────────────────────────────
+
+    private static object CreateSprite( Scene scene, JsonElement args, Vector3 position )
+    {
+        var go = SceneHelpers.CreateChildObject( scene, args, "Sprite", position );
+
+        var sr = go.Components.Create<SpriteRenderer>();
+
+        var spritePath = HandlerBase.GetString( args, "sprite" );
+        if ( !string.IsNullOrEmpty( spritePath ) )
+        {
+            var sprite = ResourceLibrary.Get<Sprite>( spritePath );
+            if ( sprite == null )
+                return HandlerBase.Error(
+                    $"Sprite not found at '{spritePath}'.",
+                    "create",
+                    "Sprite assets must be indexed. User-created sprites belong under 'Assets/'; paths are relative to Assets/." );
+            sr.Sprite = sprite;
+        }
+
+        var sizeStr = HandlerBase.GetString( args, "size" );
+        if ( sizeStr != null ) sr.Size = HandlerBase.ParseVector2( sizeStr );
+
+        HandlerBase.ApplyColor( args, "color", c => sr.Color = c );
+
+        var billboard = HandlerBase.GetString( args, "billboard" );
+        var bmParsed = HandlerBase.ResolveEnum<SpriteRenderer.BillboardMode>( billboard, "billboard", "create_sprite" );
+        if ( bmParsed.HasValue ) sr.Billboard = bmParsed.Value;
+
+        if ( HandlerBase.TryGetBool( args, "lighting", out var lit ) ) sr.Lighting = lit;
+        if ( HandlerBase.TryGetBool( args, "shadows", out var sh ) ) sr.Shadows = sh;
+        if ( HandlerBase.TryGetBool( args, "opaque", out var op ) ) sr.Opaque = op;
+        if ( HandlerBase.TryGetBool( args, "flip_horizontal", out var fh ) ) sr.FlipHorizontal = fh;
+        if ( HandlerBase.TryGetBool( args, "flip_vertical", out var fv ) ) sr.FlipVertical = fv;
+
+        var animation = HandlerBase.GetString( args, "animation" );
+        if ( !string.IsNullOrEmpty( animation ) )
+            sr.StartingAnimationName = animation;
+        if ( HandlerBase.TryGetFloat( args, "playback_speed", out var ps ) ) sr.PlaybackSpeed = ps;
+
+        return HandlerBase.Success( new
+        {
+            message = $"Created SpriteRenderer '{go.Name}'.",
+            id = go.Id.ToString(),
+            component_id = sr.Id.ToString(),
+            position = HandlerBase.V3( go.WorldPosition )
+        } );
+    }
+
+    // ── CreateProp ───────────────────────────────────────────────────
+
+    private static object CreateProp( Scene scene, JsonElement args, Vector3 position )
+    {
+        var modelPath = HandlerBase.GetString( args, "model" );
+        if ( string.IsNullOrEmpty( modelPath ) )
+            return HandlerBase.Error( "Missing required 'model' parameter for prop type.", "create" );
+
+        var go = SceneHelpers.CreateChildObject( scene, args, "Prop", position );
+
+        var prop = go.Components.Create<Prop>();
+        var resolvedModel = HandlerBase.ResolveModel( modelPath, "create_prop" );
+        if ( resolvedModel != null ) prop.Model = resolvedModel;
+
+        HandlerBase.ApplyColor( args, "tint", c => prop.Tint = c );
+
+        if ( HandlerBase.TryGetFloat( args, "health", out var h ) ) prop.Health = h;
+        if ( HandlerBase.TryGetBool( args, "is_static", out var isStatic ) ) prop.IsStatic = isStatic;
+        // Note: Prop.IsFlammable is read-only (derived from model data)
+        if ( HandlerBase.TryGetBool( args, "start_asleep", out var sa ) ) prop.StartAsleep = sa;
+
+        var materialGroup = HandlerBase.GetString( args, "material_group" );
+        if ( !string.IsNullOrEmpty( materialGroup ) )
+            prop.MaterialGroup = materialGroup;
+
+        return HandlerBase.Success( new
+        {
+            message = $"Created Prop '{go.Name}'.",
+            id = go.Id.ToString(),
+            component_id = prop.Id.ToString(),
+            model = modelPath,
+            position = HandlerBase.V3( go.WorldPosition )
+        } );
+    }
+
+    // ── CreateWorldPanel ─────────────────────────────────────────────
+
+    private static object CreateWorldPanel( Scene scene, JsonElement args, Vector3 position )
+    {
+        var go = SceneHelpers.CreateChildObject( scene, args, "World Panel", position );
+
+        var wp = go.Components.Create<WorldPanel>();
+
+        var panelSizeStr = HandlerBase.GetString( args, "panel_size" );
+        if ( panelSizeStr != null )
+            wp.PanelSize = HandlerBase.ParseVector2( panelSizeStr );
+
+        if ( HandlerBase.TryGetBool( args, "look_at_camera", out var lac ) ) wp.LookAtCamera = lac;
+        if ( HandlerBase.TryGetFloat( args, "render_scale", out var rs ) ) wp.RenderScale = rs;
+        if ( HandlerBase.TryGetFloat( args, "interaction_range", out var ir ) ) wp.InteractionRange = ir;
+
+        var hAlign = HandlerBase.GetString( args, "horizontal_align" );
+        var haParsed = HandlerBase.ResolveEnum<WorldPanel.HAlignment>( hAlign, "horizontal_align", "create_world_panel" );
+        if ( haParsed.HasValue ) wp.HorizontalAlign = haParsed.Value;
+
+        var vAlign = HandlerBase.GetString( args, "vertical_align" );
+        var vaParsed = HandlerBase.ResolveEnum<WorldPanel.VAlignment>( vAlign, "vertical_align", "create_world_panel" );
+        if ( vaParsed.HasValue ) wp.VerticalAlign = vaParsed.Value;
+
+        return HandlerBase.Success( new
+        {
+            message = $"Created WorldPanel '{go.Name}'.",
+            id = go.Id.ToString(),
+            component_id = wp.Id.ToString(),
+            panel_size = new { x = wp.PanelSize.x, y = wp.PanelSize.y },
+            position = HandlerBase.V3( go.WorldPosition )
+        } );
+    }
+
+    // ── configure_sprite ─────────────────────────────────────────────
+
+    private static object ConfigureSprite( JsonElement args )
+    {
+        var scene = HandlerBase.RequireScene( "configure_sprite" );
+
+        var id = HandlerBase.GetString( args, "id" );
+        if ( string.IsNullOrEmpty( id ) )
+            return HandlerBase.Error( "Missing required 'id' parameter.", "configure_sprite" );
+
+        var go = SceneHelpers.FindByIdOrThrow( scene, id, "configure_sprite" );
+
+        var sr = SceneHelpers.GetComponentByIdOrFirst<SpriteRenderer>( go, args );
+
+        if ( sr == null )
+            return HandlerBase.Error( $"No SpriteRenderer found on '{go.Name}'.", "configure_sprite" );
+
+        var spritePath = HandlerBase.GetString( args, "sprite" );
+        if ( !string.IsNullOrEmpty( spritePath ) )
+        {
+            var sprite = ResourceLibrary.Get<Sprite>( spritePath );
+            if ( sprite == null )
+                return HandlerBase.Error(
+                    $"Sprite not found at '{spritePath}'.",
+                    "configure_sprite",
+                    "Sprite assets must be indexed. User-created sprites belong under 'Assets/'; paths are relative to Assets/." );
+            sr.Sprite = sprite;
+        }
+
+        var sizeStr = HandlerBase.GetString( args, "size" );
+        if ( sizeStr != null ) sr.Size = HandlerBase.ParseVector2( sizeStr );
+
+        HandlerBase.ApplyColor( args, "color", c => sr.Color = c );
+
+        var billboard = HandlerBase.GetString( args, "billboard" );
+        var bmParsed = HandlerBase.ResolveEnum<SpriteRenderer.BillboardMode>( billboard, "billboard", "configure_sprite" );
+        if ( bmParsed.HasValue ) sr.Billboard = bmParsed.Value;
+
+        if ( HandlerBase.TryGetBool( args, "lighting", out var lit ) ) sr.Lighting = lit;
+        if ( HandlerBase.TryGetBool( args, "shadows", out var sh ) ) sr.Shadows = sh;
+        if ( HandlerBase.TryGetBool( args, "opaque", out var op ) ) sr.Opaque = op;
+        if ( HandlerBase.TryGetBool( args, "flip_horizontal", out var fh ) ) sr.FlipHorizontal = fh;
+        if ( HandlerBase.TryGetBool( args, "flip_vertical", out var fv ) ) sr.FlipVertical = fv;
+        if ( HandlerBase.TryGetFloat( args, "playback_speed", out var ps ) ) sr.PlaybackSpeed = ps;
+        var animation = HandlerBase.GetString( args, "animation" );
+        if ( !string.IsNullOrEmpty( animation ) )
+            sr.StartingAnimationName = animation;
+
+        var texFilter = HandlerBase.GetString( args, "texture_filter" );
+        var fmParsed = HandlerBase.ResolveEnum<Sandbox.Rendering.FilterMode>( texFilter, "texture_filter", "configure_sprite" );
+        if ( fmParsed.HasValue ) sr.TextureFilter = fmParsed.Value;
+
+        if ( HandlerBase.TryGetFloat( args, "depth_feather", out var df ) ) sr.DepthFeather = df;
+        if ( HandlerBase.TryGetFloat( args, "fog_strength", out var fs ) ) sr.FogStrength = fs;
+        if ( HandlerBase.TryGetFloat( args, "alpha_cutoff", out var ac ) ) sr.AlphaCutoff = ac;
+
+        return HandlerBase.Confirm( $"Configured SpriteRenderer on '{go.Name}'." );
+    }
+
+    // ── configure_prop ───────────────────────────────────────────────
+
+    private static object ConfigureProp( JsonElement args )
+    {
+        var scene = HandlerBase.RequireScene( "configure_prop" );
+
+        var id = HandlerBase.GetString( args, "id" );
+        if ( string.IsNullOrEmpty( id ) )
+            return HandlerBase.Error( "Missing required 'id' parameter.", "configure_prop" );
+
+        var go = SceneHelpers.FindByIdOrThrow( scene, id, "configure_prop" );
+
+        var prop = SceneHelpers.GetComponentByIdOrFirst<Prop>( go, args );
+
+        if ( prop == null )
+            return HandlerBase.Error( $"No Prop component found on '{go.Name}'.", "configure_prop" );
+
+        var modelPath = HandlerBase.GetString( args, "model" );
+        if ( !string.IsNullOrEmpty( modelPath ) )
+        {
+            var resolvedModel = HandlerBase.ResolveModel( modelPath, "configure_prop" );
+            if ( resolvedModel != null ) prop.Model = resolvedModel;
+        }
+
+        HandlerBase.ApplyColor( args, "tint", c => prop.Tint = c );
+
+        if ( HandlerBase.TryGetFloat( args, "health", out var h ) ) prop.Health = h;
+        if ( HandlerBase.TryGetBool( args, "is_static", out var isStatic ) ) prop.IsStatic = isStatic;
+        // Note: Prop.IsFlammable is read-only (derived from model data)
+        if ( HandlerBase.TryGetBool( args, "start_asleep", out var sa ) ) prop.StartAsleep = sa;
+
+        var materialGroup = HandlerBase.GetString( args, "material_group" );
+        if ( !string.IsNullOrEmpty( materialGroup ) )
+            prop.MaterialGroup = materialGroup;
+
+        if ( args.TryGetProperty( "body_groups", out var bgEl ) && bgEl.ValueKind == JsonValueKind.Number )
+            prop.BodyGroups = bgEl.GetUInt64();
+
+        return HandlerBase.Confirm( $"Configured Prop on '{go.Name}'." );
+    }
+
+    // ── configure_world_panel ────────────────────────────────────────
+
+    private static object ConfigureWorldPanel( JsonElement args )
+    {
+        var scene = HandlerBase.RequireScene( "configure_world_panel" );
+
+        var id = HandlerBase.GetString( args, "id" );
+        if ( string.IsNullOrEmpty( id ) )
+            return HandlerBase.Error( "Missing required 'id' parameter.", "configure_world_panel" );
+
+        var go = SceneHelpers.FindByIdOrThrow( scene, id, "configure_world_panel" );
+
+        var wp = SceneHelpers.GetComponentByIdOrFirst<WorldPanel>( go, args );
+
+        if ( wp == null )
+            return HandlerBase.Error( $"No WorldPanel found on '{go.Name}'.", "configure_world_panel" );
+
+        var panelSizeStr = HandlerBase.GetString( args, "panel_size" );
+        if ( panelSizeStr != null )
+            wp.PanelSize = HandlerBase.ParseVector2( panelSizeStr );
+
+        if ( HandlerBase.TryGetBool( args, "look_at_camera", out var lac ) ) wp.LookAtCamera = lac;
+        if ( HandlerBase.TryGetFloat( args, "render_scale", out var rs ) ) wp.RenderScale = rs;
+        if ( HandlerBase.TryGetFloat( args, "interaction_range", out var ir ) ) wp.InteractionRange = ir;
+
+        var hAlign = HandlerBase.GetString( args, "horizontal_align" );
+        var haParsed = HandlerBase.ResolveEnum<WorldPanel.HAlignment>( hAlign, "horizontal_align", "configure_world_panel" );
+        if ( haParsed.HasValue ) wp.HorizontalAlign = haParsed.Value;
+
+        var vAlign = HandlerBase.GetString( args, "vertical_align" );
+        var vaParsed = HandlerBase.ResolveEnum<WorldPanel.VAlignment>( vAlign, "vertical_align", "configure_world_panel" );
+        if ( vaParsed.HasValue ) wp.VerticalAlign = vaParsed.Value;
+
+        return HandlerBase.Confirm( $"Configured WorldPanel on '{go.Name}'." );
     }
 }

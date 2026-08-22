@@ -13,7 +13,6 @@ namespace Arenula;
 /// audio tool: create, configure.
 /// Consolidates 5 Ozmium create tools into 1 create action with type param.
 /// Types: point, soundscape, box, dsp_volume, listener.
-/// Ported from AudioToolHandlers.cs (425 lines).
 /// </summary>
 internal static class AudioHandler
 {
@@ -41,9 +40,7 @@ internal static class AudioHandler
 
     private static object Create( JsonElement args )
     {
-        var scene = SceneHelpers.ResolveScene();
-        if ( scene == null )
-            return HandlerBase.Error( "No active scene.", "create" );
+        var scene = HandlerBase.RequireScene( "create" );
 
         var type = HandlerBase.GetString( args, "type", "point" );
         var posStr = HandlerBase.GetString( args, "position" );
@@ -65,27 +62,16 @@ internal static class AudioHandler
 
     private static object CreateSoundPoint( Scene scene, JsonElement args, Vector3 position )
     {
-        var go = scene.CreateObject();
-        go.Name = HandlerBase.GetString( args, "name" ) ?? "Sound Point";
-        go.WorldPosition = position;
+        var go = SceneHelpers.CreateChildObject( scene, args, "Sound Point", position );
 
         var snd = go.Components.Create<SoundPointComponent>();
 
         var soundEvent = HandlerBase.GetString( args, "sound_event" );
         if ( !string.IsNullOrEmpty( soundEvent ) )
-        {
-            var asset = AssetSystem.FindByPath( soundEvent );
-            if ( asset != null )
-            {
-                var ev = asset.LoadResource<SoundEvent>();
-                if ( ev != null ) snd.SoundEvent = ev;
-            }
-        }
+            snd.SoundEvent = HandlerBase.RequireResource<SoundEvent>( soundEvent, "create_audio_source" );
 
-        if ( args.TryGetProperty( "volume", out var vEl ) && vEl.ValueKind == JsonValueKind.Number )
-            snd.Volume = vEl.GetSingle();
-        if ( args.TryGetProperty( "pitch", out var pEl ) && pEl.ValueKind == JsonValueKind.Number )
-            snd.Pitch = pEl.GetSingle();
+        if ( HandlerBase.TryGetFloat( args, "volume", out var v ) ) snd.Volume = v;
+        if ( HandlerBase.TryGetFloat( args, "pitch", out var p ) ) snd.Pitch = p;
         snd.PlayOnStart = HandlerBase.GetBool( args, "play_on_start", true );
         snd.Repeat = HandlerBase.GetBool( args, "repeat", false );
 
@@ -100,20 +86,16 @@ internal static class AudioHandler
 
     private static object CreateSoundscape( Scene scene, JsonElement args, Vector3 position )
     {
-        var go = scene.CreateObject();
-        go.Name = HandlerBase.GetString( args, "name" ) ?? "Soundscape Trigger";
-        go.WorldPosition = position;
+        var go = SceneHelpers.CreateChildObject( scene, args, "Soundscape Trigger", position );
 
         var st = go.Components.Create<SoundscapeTrigger>();
 
         var triggerType = HandlerBase.GetString( args, "trigger_type", "Sphere" );
-        if ( Enum.TryParse<SoundscapeTrigger.TriggerType>( triggerType, true, out var tt ) )
-            st.Type = tt;
+        var ttParsed = HandlerBase.ResolveEnum<SoundscapeTrigger.TriggerType>( triggerType, "trigger_type", "create_soundscape_trigger" );
+        if ( ttParsed.HasValue ) st.Type = ttParsed.Value;
 
-        if ( args.TryGetProperty( "volume", out var vEl ) && vEl.ValueKind == JsonValueKind.Number )
-            st.Volume = vEl.GetSingle();
-        if ( args.TryGetProperty( "radius", out var rEl ) && rEl.ValueKind == JsonValueKind.Number )
-            st.Radius = rEl.GetSingle();
+        if ( HandlerBase.TryGetFloat( args, "volume", out var v ) ) st.Volume = v;
+        if ( HandlerBase.TryGetFloat( args, "radius", out var r ) ) st.Radius = r;
         st.StayActiveOnExit = HandlerBase.GetBool( args, "stay_active_on_exit", true );
 
         var boxSizeStr = HandlerBase.GetString( args, "box_size" );
@@ -122,14 +104,7 @@ internal static class AudioHandler
 
         var scapePath = HandlerBase.GetString( args, "soundscape_path" );
         if ( !string.IsNullOrEmpty( scapePath ) )
-        {
-            var asset = AssetSystem.FindByPath( scapePath );
-            if ( asset != null )
-            {
-                var scape = asset.LoadResource<Soundscape>();
-                if ( scape != null ) st.Soundscape = scape;
-            }
-        }
+            st.Soundscape = HandlerBase.RequireResource<Soundscape>( scapePath, "create_soundscape_trigger" );
 
         return HandlerBase.Success( new
         {
@@ -143,13 +118,10 @@ internal static class AudioHandler
 
     private static object CreateSoundBox( Scene scene, JsonElement args, Vector3 position )
     {
-        var go = scene.CreateObject();
-        go.Name = HandlerBase.GetString( args, "name" ) ?? "Sound Box";
-        go.WorldPosition = position;
+        var go = SceneHelpers.CreateChildObject( scene, args, "Sound Box", position );
 
         var sb = go.Components.Create<SoundBoxComponent>();
-        if ( args.TryGetProperty( "volume", out var vEl ) && vEl.ValueKind == JsonValueKind.Number )
-            sb.Volume = vEl.GetSingle();
+        if ( HandlerBase.TryGetFloat( args, "volume", out var v ) ) sb.Volume = v;
         sb.PlayOnStart = HandlerBase.GetBool( args, "play_on_start", true );
         sb.Repeat = HandlerBase.GetBool( args, "repeat", false );
 
@@ -159,14 +131,7 @@ internal static class AudioHandler
 
         var soundEvent = HandlerBase.GetString( args, "sound_event" );
         if ( !string.IsNullOrEmpty( soundEvent ) )
-        {
-            var asset = AssetSystem.FindByPath( soundEvent );
-            if ( asset != null )
-            {
-                var ev = asset.LoadResource<SoundEvent>();
-                if ( ev != null ) sb.SoundEvent = ev;
-            }
-        }
+            sb.SoundEvent = HandlerBase.RequireResource<SoundEvent>( soundEvent, "create_sound_box" );
 
         return HandlerBase.Success( new
         {
@@ -179,9 +144,7 @@ internal static class AudioHandler
 
     private static object CreateDspVolume( Scene scene, JsonElement args, Vector3 position )
     {
-        var go = scene.CreateObject();
-        go.Name = HandlerBase.GetString( args, "name" ) ?? "DSP Volume";
-        go.WorldPosition = position;
+        var go = SceneHelpers.CreateChildObject( scene, args, "DSP Volume", position );
 
         var dsp = go.Components.Create<DspVolume>();
         dsp.Priority = HandlerBase.GetInt( args, "priority", 0 );
@@ -192,8 +155,8 @@ internal static class AudioHandler
 
         var sv = dsp.SceneVolume;
         var volumeType = HandlerBase.GetString( args, "volume_type", "Box" );
-        if ( Enum.TryParse<Sandbox.Volumes.SceneVolume.VolumeTypes>( volumeType, true, out var vt ) )
-            sv.Type = vt;
+        var vtParsed = HandlerBase.ResolveEnum<Sandbox.Volumes.SceneVolume.VolumeTypes>( volumeType, "volume_type", "create_volume" );
+        if ( vtParsed.HasValue ) sv.Type = vtParsed.Value;
 
         if ( sv.Type == Sandbox.Volumes.SceneVolume.VolumeTypes.Box )
         {
@@ -227,9 +190,7 @@ internal static class AudioHandler
 
     private static object CreateAudioListener( Scene scene, JsonElement args, Vector3 position )
     {
-        var go = scene.CreateObject();
-        go.Name = HandlerBase.GetString( args, "name" ) ?? "Audio Listener";
-        go.WorldPosition = position;
+        var go = SceneHelpers.CreateChildObject( scene, args, "Audio Listener", position );
 
         var listener = go.Components.Create<AudioListener>();
         listener.UseCameraDirection = HandlerBase.GetBool( args, "use_camera_direction", true );
@@ -244,13 +205,10 @@ internal static class AudioHandler
     }
 
     // ── configure ─────────────────────────────────────────────────────
-    // Ported from AudioToolHandlers.ConfigureSound
 
     private static object Configure( JsonElement args )
     {
-        var scene = SceneHelpers.ResolveScene();
-        if ( scene == null )
-            return HandlerBase.Error( "No active scene.", "configure" );
+        var scene = HandlerBase.RequireScene( "configure" );
 
         var id = HandlerBase.GetString( args, "id" );
         if ( string.IsNullOrEmpty( id ) )
@@ -276,30 +234,14 @@ internal static class AudioHandler
 
         var soundEvent = HandlerBase.GetString( args, "sound_event" );
         if ( !string.IsNullOrEmpty( soundEvent ) )
-        {
-            var asset = AssetSystem.FindByPath( soundEvent );
-            if ( asset != null )
-            {
-                var ev = asset.LoadResource<SoundEvent>();
-                if ( ev != null ) snd.SoundEvent = ev;
-            }
-        }
+            snd.SoundEvent = HandlerBase.RequireResource<SoundEvent>( soundEvent, "configure_audio_source" );
 
-        if ( args.TryGetProperty( "volume", out var vEl ) && vEl.ValueKind == JsonValueKind.Number )
-            snd.Volume = vEl.GetSingle();
-        if ( args.TryGetProperty( "pitch", out var pEl ) && pEl.ValueKind == JsonValueKind.Number )
-            snd.Pitch = pEl.GetSingle();
-        if ( args.TryGetProperty( "play_on_start", out var posEl ) &&
-             ( posEl.ValueKind == JsonValueKind.True || posEl.ValueKind == JsonValueKind.False ) )
-            snd.PlayOnStart = posEl.GetBoolean();
-        if ( args.TryGetProperty( "repeat", out var repEl ) &&
-             ( repEl.ValueKind == JsonValueKind.True || repEl.ValueKind == JsonValueKind.False ) )
-            snd.Repeat = repEl.GetBoolean();
-        if ( args.TryGetProperty( "distance_attenuation", out var daEl ) &&
-             ( daEl.ValueKind == JsonValueKind.True || daEl.ValueKind == JsonValueKind.False ) )
-            snd.DistanceAttenuation = daEl.GetBoolean();
-        if ( args.TryGetProperty( "distance", out var dEl ) && dEl.ValueKind == JsonValueKind.Number )
-            snd.Distance = dEl.GetSingle();
+        if ( HandlerBase.TryGetFloat( args, "volume", out var v ) ) snd.Volume = v;
+        if ( HandlerBase.TryGetFloat( args, "pitch", out var p ) ) snd.Pitch = p;
+        if ( HandlerBase.TryGetBool( args, "play_on_start", out var pos ) ) snd.PlayOnStart = pos;
+        if ( HandlerBase.TryGetBool( args, "repeat", out var rep ) ) snd.Repeat = rep;
+        if ( HandlerBase.TryGetBool( args, "distance_attenuation", out var da ) ) snd.DistanceAttenuation = da;
+        if ( HandlerBase.TryGetFloat( args, "distance", out var d ) ) snd.Distance = d;
 
         return HandlerBase.Confirm( $"Configured sound on '{go.Name}' ({snd.GetType().Name})." );
     }

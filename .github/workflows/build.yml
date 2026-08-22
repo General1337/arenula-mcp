@@ -21,3 +21,10 @@ jobs:
 
       - name: Install and build
         run: npm run setup
+
+      # Pure static analysis of ToolRegistry.cs against the handlers — needs no s&box
+      # install and no .NET, so it runs here rather than only on a dev machine. Catches
+      # a tool advertising parameters its handler ignores, or reading ones it never
+      # declared; neither is a compile error and neither throws at runtime.
+      - name: Check MCP tool contracts
+        run: npm run check-contracts

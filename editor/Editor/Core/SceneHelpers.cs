@@ -2,6 +2,7 @@ using System;
 using System.Collections.Generic;
 using System.Linq;
 using System.Text;
+using System.Text.Json;
 using Editor;
 using Sandbox;
 
@@ -9,29 +10,44 @@ namespace Arenula;
 
 /// <summary>
 /// Scene resolution, tree walking, object lookup, and component helpers.
-/// Ported from Ozmium OzmiumSceneHelpers + SceneQueryHelpers.
 /// </summary>
 internal static class SceneHelpers
 {
-    // ── Scene resolution ────────────────────────────────────────────────
+    // ── Scene / session resolution ──────────────────────────────────────
 
     /// <summary>
-    /// Returns the best available scene:
-    /// 1. Active SceneEditorSession.Scene (editor)
-    /// 2. First available editor session
-    /// 3. Game.ActiveScene (play mode)
-    /// 4. null
+    /// Returns the active editor session, falling back to the first open session
+    /// with a valid scene. session.list surfaces SceneEditorSession.All; the
+    /// editor's transient focus state can leave .Active null even while .All still
+    /// holds the session (e.g. the scene tab isn't the focused dock), so all
+    /// session-bound actions resolve through here to stay consistent with what
+    /// session.list reports and avoid spurious "No editor session" failures.
     /// </summary>
-    internal static Scene ResolveScene()
+    internal static SceneEditorSession ResolveSession()
     {
         try
         {
             var active = SceneEditorSession.Active;
-            if ( active?.Scene != null ) return active.Scene;
-            foreach ( var s in SceneEditorSession.All )
-                if ( s?.Scene != null ) return s.Scene;
+            if ( active?.Scene != null ) return active;
+            var all = SceneEditorSession.All;
+            if ( all != null )
+                foreach ( var s in all )
+                    if ( s?.Scene != null ) return s;
         }
         catch { }
+        return null;
+    }
+
+    /// <summary>
+    /// Returns the best available scene:
+    /// 1. Resolved editor session scene (active, else first open)
+    /// 2. Game.ActiveScene (play mode)
+    /// 3. null
+    /// </summary>
+    internal static Scene ResolveScene()
+    {
+        var session = ResolveSession();
+        if ( session?.Scene != null ) return session.Scene;
         if ( Game.ActiveScene != null ) return Game.ActiveScene;
         return null;
     }
@@ -209,6 +225,32 @@ internal static class SceneHelpers
         sb.AppendLine( $"{indent}- {go.Name} (ID: {go.Id}){disStr}{tagStr}{compStr}{childStr}" );
     }
 
+    // ── GameObject creation ────────────────────────────────────────────────
+
+    /// <summary>
+    /// Creates a child GameObject in the scene with the standard "create" ritual:
+    /// scene.CreateObject() + Name (from args["name"] or defaultName) + WorldPosition.
+    /// Replaces the 3-line boilerplate at every Create* handler call site.
+    /// </summary>
+    internal static GameObject CreateChildObject( Scene scene, JsonElement args, string defaultName, Vector3 position )
+    {
+        var go = scene.CreateObject();
+        go.Name = HandlerBase.GetString( args, "name" ) ?? defaultName;
+        go.WorldPosition = position;
+        return go;
+    }
+
+    /// <summary>
+    /// As above, but also sets WorldRotation. Used by handlers that take a rotation
+    /// alongside position (currently only camera).
+    /// </summary>
+    internal static GameObject CreateChildObject( Scene scene, JsonElement args, string defaultName, Vector3 position, Rotation rotation )
+    {
+        var go = CreateChildObject( scene, args, defaultName, position );
+        go.WorldRotation = rotation;
+        return go;
+    }
+
     // ── Asset path normalization ──────────────────────────────────────────
 
     /// <summary>
@@ -223,89 +265,37 @@ internal static class SceneHelpers
     }
 
     // ── Selection helpers ─────────────────────────────────────────────────
+    // Direct calls into Sandbox.SelectionSystem via SceneEditorSession.Selection.
+    // (Previously used reflection — the `using Editor;` dependency was already
+    // in scope, so the reflection was unnecessary defensive code.)
 
-    /// <summary>
-    /// Returns the currently selected GameObjects in the editor, using reflection
-    /// to access the editor Selection API without hard dependencies.
-    /// </summary>
+    /// <summary>Returns the currently selected GameObjects in the editor.</summary>
     internal static List<GameObject> GetSelectedGameObjects()
     {
         var result = new List<GameObject>();
-        try
-        {
-            var session = SceneEditorSession.Active;
-            if ( session == null ) return result;
-            var selProp = session.GetType().GetProperty( "Selection",
-                System.Reflection.BindingFlags.Public | System.Reflection.BindingFlags.Instance );
-            var selObj = selProp?.GetValue( session );
-            if ( selObj == null ) return result;
-            if ( selObj is IEnumerable<object> objs )
-                foreach ( var o in objs )
-                    if ( o is GameObject go ) result.Add( go );
-        }
-        catch { }
+        var sel = ResolveSession()?.Selection;
+        if ( sel == null ) return result;
+        foreach ( var o in sel )
+            if ( o is GameObject go ) result.Add( go );
         return result;
     }
 
-    /// <summary>
-    /// Sets the editor selection to a single GameObject using reflection.
-    /// </summary>
+    /// <summary>Sets the editor selection to a single GameObject.</summary>
     internal static bool SelectGameObject( GameObject go )
-    {
-        try
-        {
-            var session = SceneEditorSession.Active;
-            if ( session == null ) return false;
-            var selProp = session.GetType().GetProperty( "Selection",
-                System.Reflection.BindingFlags.Public | System.Reflection.BindingFlags.Instance );
-            var selObj = selProp?.GetValue( session );
-            if ( selObj == null ) return false;
-            var setMethod = selObj.GetType().GetMethod( "Set", new[] { typeof( GameObject ) } );
-            setMethod?.Invoke( selObj, new object[] { go } );
-            return true;
-        }
-        catch { return false; }
-    }
+        => ResolveSession()?.Selection?.Set( go ) ?? false;
 
-    /// <summary>
-    /// Clears the editor selection using reflection.
-    /// </summary>
+    /// <summary>Clears the editor selection.</summary>
     internal static bool ClearSelection()
     {
-        try
-        {
-            var session = SceneEditorSession.Active;
-            if ( session == null ) return false;
-            var selProp = session.GetType().GetProperty( "Selection",
-                System.Reflection.BindingFlags.Public | System.Reflection.BindingFlags.Instance );
-            var selObj = selProp?.GetValue( session );
-            if ( selObj == null ) return false;
-            var clearMethod = selObj.GetType().GetMethod( "Clear" );
-            clearMethod?.Invoke( selObj, null );
-            return true;
-        }
-        catch { return false; }
+        var sel = ResolveSession()?.Selection;
+        if ( sel == null ) return false;
+        sel.Clear();
+        return true;
     }
 
-    /// <summary>
-    /// Adds a GameObject to the editor selection using reflection.
-    /// </summary>
+    /// <summary>Adds a GameObject to the editor selection.</summary>
     internal static bool AddToSelection( GameObject go )
-    {
-        try
-        {
-            var session = SceneEditorSession.Active;
-            if ( session == null ) return false;
-            var selProp = session.GetType().GetProperty( "Selection",
-                System.Reflection.BindingFlags.Public | System.Reflection.BindingFlags.Instance );
-            var selObj = selProp?.GetValue( session );
-            if ( selObj == null ) return false;
-            var addMethod = selObj.GetType().GetMethod( "Add", new[] { typeof( object ) } );
-            addMethod?.Invoke( selObj, new object[] { go } );
-            return true;
-        }
-        catch { return false; }
-    }
+        => ResolveSession()?.Selection?.Add( go ) ?? false;
 
     /// <summary>
     /// Gets the world-space bounding box of a GameObject, trying collider bounds first,
@@ -331,5 +321,21 @@ internal static class SceneHelpers
         }
 
         return BBox.FromPositionAndSize( go.WorldPosition, 1f );
+    }
+
+    // ── Cleanup helpers (refactor-cleanup.md Card 4) ──────────────────
+
+    /// <summary>
+    /// Look up a component of type T on the GameObject: by GUID from the
+    /// "component_id" arg if provided, else the first of that type.
+    /// Returns null if nothing matches.
+    /// </summary>
+    internal static T GetComponentByIdOrFirst<T>( GameObject go, JsonElement args, string idParam = "component_id" )
+        where T : Component
+    {
+        var compId = HandlerBase.GetString( args, idParam );
+        if ( !string.IsNullOrEmpty( compId ) && Guid.TryParse( compId, out var cGuid ) )
+            return go.Components.GetAll().FirstOrDefault( c => c is T && c.Id == cGuid ) as T;
+        return go.Components.Get<T>();
     }
 }
