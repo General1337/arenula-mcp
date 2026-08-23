@@ -23,12 +23,14 @@ internal static class PipelineHandler
                 "compile_and_verify"  => await CompileAndVerify( args ),
                 "probe_typelibrary"   => await ProbeTypeLibrary( args ),
                 _ => HandlerBase.Error( $"Unknown pipeline action '{action}'", action,
-                    "Valid actions: compile_and_verify, probe_typelibrary" )
+                    "Valid actions: compile_and_verify, probe_typelibrary",
+                    null, McpErrorCode.UnknownAction )
             };
         }
         catch ( Exception ex )
         {
-            return HandlerBase.Error( $"pipeline.{action} failed: {ex.Message}", action );
+            return HandlerBase.Error( $"pipeline.{action} failed: {ex.Message}", action,
+                null, null, McpErrorCode.InternalException );
         }
     }
 
@@ -85,6 +87,25 @@ internal static class PipelineHandler
                         : "untitled scene (no file path)"
                 } );
             }
+            else if ( SceneIntegrityGuard.TryGetHold( session.Scene?.Source?.ResourcePath, out var pipeHold ) )
+            {
+                // Findings #5 follow-up: this raw Save(false) bypassed the scene-integrity
+                // guard — after a partial/stale reload it would serialize the incomplete
+                // in-memory state over disk (the 8K-line-loss class). Compile does not
+                // require a disk save, so refusing here is safe; the pipeline continues.
+                steps.Add( new
+                {
+                    step = "save",
+                    status = "refused",
+                    reason = pipeHold.Reason,
+                    hold_placed_utc = pipeHold.PlacedUtc.ToString( "yyyy-MM-ddTHH:mm:ssZ" ),
+                    disk_game_objects = pipeHold.DiskGameObjects,
+                    memory_game_objects = pipeHold.MemoryGameObjects,
+                    hint = "Active scene-integrity hold on this scene. Run editor.reload_scene until " +
+                           "integrity.verified=true, or editor.save_scene force=true if the in-memory " +
+                           "state is intentionally what should be on disk. Compile proceeds without a save."
+                } );
+            }
             else
             {
                 session.Save( false );
@@ -107,7 +128,7 @@ internal static class PipelineHandler
                 try
                 {
                     var recoveryResult = EditorHandler.ReloadScene( BuildArgs( new { action = "reload_scene" } ) );
-                    steps.Add( new { step = "save_recovery", status = "reloaded", trigger = "assert_on_save", result = recoveryResult } );
+                    steps.Add( new { step = "save_recovery", status = "reloaded", trigger = "assert_on_save", result = SummarizeStepResult( recoveryResult ) } );
                 }
                 catch ( Exception rex )
                 {
@@ -149,7 +170,7 @@ internal static class PipelineHandler
                         status = "ok",
                         reason = "playing + recent Component/BasePostProcess edit — clearing live instances before DLL swap",
                         touched_files = recentComponentFiles,
-                        result = reloadResult
+                        result = SummarizeStepResult( reloadResult )
                     } );
                 }
                 else
@@ -182,7 +203,8 @@ internal static class PipelineHandler
         catch ( Exception ex )
         {
             steps.Add( new { step = "compile_trigger", status = "error", message = ex.Message } );
-            return MakeResult( "fail", "compile_trigger", steps, "Compilation trigger failed." );
+            return MakeResult( "fail", "compile_trigger", steps, "Compilation trigger failed.",
+                McpErrorCode.CompileFailed );
         }
 
         // Step 3: Wait for compilation
@@ -195,7 +217,8 @@ internal static class PipelineHandler
         catch ( Exception ex )
         {
             steps.Add( new { step = "compile_wait", status = "error", message = ex.Message } );
-            return MakeResult( "fail", "compile_wait", steps, "Compilation timed out or failed." );
+            return MakeResult( "fail", "compile_wait", steps, "Compilation timed out or failed.",
+                McpErrorCode.CompileTimeout );
         }
 
         // Step 4: Check for errors
@@ -204,12 +227,13 @@ internal static class PipelineHandler
         {
             var errorsArgs = BuildArgs( new { action = "errors", severity = "error" } );
             errorsResult = await CompileHandler.HandleAsync( "errors", errorsArgs );
-            steps.Add( new { step = "compile_errors", status = "ok", result = errorsResult } );
+            steps.Add( new { step = "compile_errors", status = "ok", result = SummarizeStepResult( errorsResult ) } );
         }
         catch ( Exception ex )
         {
             steps.Add( new { step = "compile_errors", status = "error", message = ex.Message } );
-            return MakeResult( "fail", "compile_errors", steps, "Could not read compile errors." );
+            return MakeResult( "fail", "compile_errors", steps, "Could not read compile errors.",
+                McpErrorCode.InternalException );
         }
 
         // Check if there are actual compile errors
@@ -217,7 +241,8 @@ internal static class PipelineHandler
         if ( hasErrors )
         {
             return MakeResult( "fail", "compilation", steps,
-                "Compilation produced errors. Fix them and retry." );
+                "Compilation produced errors. Fix them and retry.",
+                McpErrorCode.CompileFailed );
         }
 
         // Invalidate ConCmd cache after successful recompile
@@ -313,7 +338,8 @@ internal static class PipelineHandler
                 "Components.Get<T>() / scene.GetAllComponents<T>() will return null. " +
                 "Do NOT call editor.start_play. Ask the user to cold-restart S&Box (close the " +
                 "editor, relaunch, reload the scene) and retry the edit afterwards. " +
-                "See steps.hotreload_verify.hotload_log_tail for the engine's own signal." );
+                "See steps.hotreload_verify.hotload_log_tail for the engine's own signal.",
+                McpErrorCode.TypeLibraryCorrupted );
         }
 
         // Belt-and-braces: recompile can invalidate scene state even when the
@@ -345,7 +371,7 @@ internal static class PipelineHandler
                     step = "post_compile_recovery",
                     status = "reloaded",
                     trigger = integrity,
-                    result = recoveryResult
+                    result = SummarizeStepResult( recoveryResult )
                 } );
             }
         }
@@ -389,19 +415,21 @@ internal static class PipelineHandler
                     overall = verifyOverall,
                     failed_checks = failedChecks,
                     failure_summary = failureSummary,
-                    result = verifyResult
+                    result = SummarizeStepResult( verifyResult )
                 } );
 
                 if ( verifyOverall == "fail" )
                 {
                     return MakeResult( "fail", "sbep_verify", steps,
-                        "SBEP verification found failures. Inspect steps.sbep_verify.failure_summary for the specific failed items — no re-invocation needed." );
+                        "SBEP verification found failures. Inspect steps.sbep_verify.failure_summary for the specific failed items — no re-invocation needed.",
+                        McpErrorCode.VerifyFailed );
                 }
             }
             catch ( Exception ex )
             {
                 steps.Add( new { step = "sbep_verify", status = "error", message = ex.Message } );
-                return MakeResult( "fail", "sbep_verify", steps, $"SBEP verify error: {ex.Message}" );
+                return MakeResult( "fail", "sbep_verify", steps, $"SBEP verify error: {ex.Message}",
+                    McpErrorCode.InternalException );
             }
         }
         else
@@ -414,16 +442,96 @@ internal static class PipelineHandler
         return MakeResult( "pass", (string)null, steps, null );
     }
 
-    private static object MakeResult( string overall, string failedStep, List<object> steps, string actionable )
+    private static object MakeResult( string overall, string failedStep, List<object> steps, string actionable, string failureCode = null )
     {
         return HandlerBase.Success( new
         {
             overall,
             failed_step = failedStep,
+            failure_code = failureCode,
             step_count = steps.Count,
             steps,
             actionable
         } );
+    }
+
+    /// <summary>
+    /// Findings #6 payload diet: collapse a nested sub-handler result into a compact summary
+    /// instead of embedding it whole — full pipeline responses ballooned past 500KB and forced
+    /// cursor-pagination spirals. Small results pass through untouched. Large ones become
+    /// per-property summaries (scalars kept, arrays → count + first 3 items) plus a detail
+    /// cursor: the full sub-result JSON sits in <see cref="CursorStore"/> for 60s, fetchable
+    /// via the 'continue' tool only when the summary is not enough.
+    /// </summary>
+    private static object SummarizeStepResult( object subResult )
+    {
+        const int InlineThresholdChars = 700; // below this, summarizing costs more than it saves
+        const int MaxFirstItems = 3;
+        const int MaxInlineChars = 200;       // per-value cap inside a summary
+
+        try
+        {
+            var inner = SbepVerifyHandler.UnwrapContentJson( subResult );
+            string fullJson = inner.HasValue
+                ? inner.Value.GetRawText()
+                : JsonSerializer.Serialize( subResult );
+
+            if ( fullJson.Length <= InlineThresholdChars )
+                return inner.HasValue ? JsonSerializer.Deserialize<object>( fullJson ) : subResult;
+
+            var summary = new Dictionary<string, object>();
+            if ( inner is { ValueKind: JsonValueKind.Object } )
+            {
+                foreach ( var prop in inner.Value.EnumerateObject() )
+                {
+                    switch ( prop.Value.ValueKind )
+                    {
+                        case JsonValueKind.Array:
+                            int len = prop.Value.GetArrayLength();
+                            summary[prop.Name + "_count"] = len;
+                            if ( len > 0 )
+                            {
+                                summary[prop.Name + "_first"] = prop.Value.EnumerateArray()
+                                    .Take( MaxFirstItems )
+                                    .Select( el =>
+                                    {
+                                        var raw = el.GetRawText();
+                                        return raw.Length <= MaxInlineChars
+                                            ? JsonSerializer.Deserialize<object>( raw )
+                                            : (object)(raw.Substring( 0, MaxInlineChars ) + "…");
+                                    } )
+                                    .ToList();
+                            }
+                            break;
+
+                        case JsonValueKind.Object:
+                            var objRaw = prop.Value.GetRawText();
+                            summary[prop.Name] = objRaw.Length <= MaxInlineChars
+                                ? JsonSerializer.Deserialize<object>( objRaw )
+                                : $"{{…{objRaw.Length} chars — see detail cursor}}";
+                            break;
+
+                        default:
+                            var scalarRaw = prop.Value.GetRawText();
+                            summary[prop.Name] = scalarRaw.Length <= MaxInlineChars
+                                ? JsonSerializer.Deserialize<object>( scalarRaw )
+                                : (object)(scalarRaw.Substring( 0, MaxInlineChars ) + "…");
+                            break;
+                    }
+                }
+            }
+
+            summary["_summarized"] = true;
+            summary["_full_chars"] = fullJson.Length;
+            summary["_detail_cursor"] = CursorStore.StoreDetail( fullJson );
+            summary["_detail_hint"] = "Full sub-result stored server-side for 60s — fetch with the " +
+                                      "'continue' tool (cursor_id = _detail_cursor) only if this summary is not enough.";
+            return summary;
+        }
+        catch
+        {
+            return subResult; // summarization must never break the pipeline
+        }
     }
 
     private static bool HasCompileErrors( object result )
@@ -542,7 +650,7 @@ internal static class PipelineHandler
     /// to check every edited file, not just the hotload-risky ones, because a "safe"
     /// method-body edit still produces new IL we want to confirm is loaded.
     /// </summary>
-    private static List<string> ListRecentCsFiles( int secondsBack )
+    internal static List<string> ListRecentCsFiles( int secondsBack )
     {
         var results = new List<string>();
         try
@@ -583,7 +691,7 @@ internal static class PipelineHandler
     /// as "probe found fewer types than expected" which is a normal steady state after
     /// heavy edits and not a failure mode on its own.
     /// </summary>
-    private static List<string> ExtractDeclaredTypes( List<string> relPaths )
+    internal static List<string> ExtractDeclaredTypes( List<string> relPaths )
     {
         var types = new HashSet<string>( StringComparer.Ordinal );
         if ( relPaths == null || relPaths.Count == 0 ) return new List<string>();
@@ -617,7 +725,7 @@ internal static class PipelineHandler
     /// Probe result for <see cref="ProbeTypes"/> — aggregate counts + per-type breakdown
     /// so the response can show exactly which types failed to resolve.
     /// </summary>
-    private readonly record struct ProbeResult(
+    internal readonly record struct ProbeResult(
         int attempted, int found, int missing,
         List<object> foundTypes, List<string> missingTypes );
 
@@ -631,7 +739,7 @@ internal static class PipelineHandler
     /// original source of the false-stall false-positive documented in
     /// <c>docs/ai/sessions/2026-04-18-mcp-pipeline-false-stall/packet.md</c>.
     /// </summary>
-    private static ProbeResult ProbeTypes( List<string> typeNames )
+    internal static ProbeResult ProbeTypes( List<string> typeNames )
     {
         var found = new List<object>();
         var missing = new List<string>();

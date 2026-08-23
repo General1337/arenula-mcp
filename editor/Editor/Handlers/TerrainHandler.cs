@@ -42,8 +42,11 @@ internal static class TerrainHandler
             "import_heightmap"  => ImportHeightmap( scene, args ),
             "export_heightmap"  => ExportHeightmap( scene, args ),
             "sync"              => Sync( scene, args ),
+            "configure_clutter"  => ConfigureClutter( scene, args ),
+            "regenerate_clutter" => RegenerateClutter( scene, args ),
+            "clear_clutter"      => ClearClutter( scene, args ),
             _                   => HandlerBase.Error( $"Unknown action '{action}' for tool 'terrain'.", action,
-                "Valid actions: create, configure, get_info, get_height, get_height_region, set_height, noise, erode, stamp, add_material, remove_material, get_material_at, blend_materials, set_hole, paint_material, import_heightmap, export_heightmap, sync" )
+                "Valid actions: create, configure, get_info, get_height, get_height_region, set_height, noise, erode, stamp, add_material, remove_material, get_material_at, blend_materials, set_hole, paint_material, import_heightmap, export_heightmap, sync, configure_clutter, regenerate_clutter, clear_clutter" )
         };
     }
 
@@ -1457,5 +1460,121 @@ internal static class TerrainHandler
         }
 
         return terrain;
+    }
+
+    // ── Clutter scattering ────────────────────────────────────────────
+    //
+    // Ported from upstream Arenula e01504f (2026-08-05). ClutterComponent
+    // scatters models across terrain from a .clutter definition. These three
+    // are the authoring loop: point it at a definition, re-scatter after a
+    // heightmap edit, wipe it.
+
+    private static object ConfigureClutter( Scene scene, JsonElement args )
+    {
+        var (clutter, go, error) = RequireClutter( scene, args, "configure_clutter" );
+        if ( clutter == null ) return error;
+
+        var defPath = HandlerBase.GetString( args, "definition" );
+        if ( !string.IsNullOrEmpty( defPath ) )
+        {
+            var def = ResourceLibrary.Get<Sandbox.Clutter.ClutterDefinition>( defPath );
+            if ( def == null )
+                return HandlerBase.Error(
+                    $"ClutterDefinition not found at '{defPath}'.",
+                    "configure_clutter",
+                    "User-created .clutter files must live under 'Assets/'. The path is relative to Assets/ " +
+                    "(e.g. 'volcano_ground.clutter' for Assets/volcano_ground.clutter — no 'Assets/' prefix).",
+                    null,
+                    McpErrorCode.NotFound );
+            clutter.Clutter = def;
+        }
+
+        if ( HandlerBase.TryGetInt( args, "seed", out var seed ) )
+            clutter.Seed = seed;
+
+        var mode = HandlerBase.ResolveEnum<Sandbox.Clutter.ClutterComponent.ClutterMode>(
+            HandlerBase.GetString( args, "mode" ), "mode", "configure_clutter" );
+        if ( mode.HasValue ) clutter.Mode = mode.Value;
+
+        // Post-condition: a definition was asked for, so one must be attached.
+        // ResourceLibrary can resolve to null without throwing, and a success
+        // response over a null Clutter field is the silent-no-op case.
+        if ( !string.IsNullOrEmpty( defPath ) && clutter.Clutter == null )
+            return HandlerBase.Error(
+                $"Definition '{defPath}' was accepted but the Clutter field is null afterwards — nothing was attached.",
+                "configure_clutter",
+                "Confirm the .clutter file is under 'Assets/' with asset_query.get_status.",
+                null,
+                McpErrorCode.NotFound );
+
+        return HandlerBase.Success( new
+        {
+            message = $"Configured ClutterComponent on '{go.Name}': seed={clutter.Seed}, mode={clutter.Mode}.",
+            verified = new
+            {
+                clutter_assigned = clutter.Clutter?.ResourceName,
+                seed = clutter.Seed,
+                mode = clutter.Mode.ToString(),
+                infinite = clutter.Infinite
+            }
+        } );
+    }
+
+    private static object RegenerateClutter( Scene scene, JsonElement args )
+    {
+        var (clutter, go, error) = RequireClutter( scene, args, "regenerate_clutter" );
+        if ( clutter == null ) return error;
+
+        var minStr = HandlerBase.GetString( args, "bounds_min" );
+        var maxStr = HandlerBase.GetString( args, "bounds_max" );
+
+        if ( !string.IsNullOrEmpty( minStr ) && !string.IsNullOrEmpty( maxStr ) )
+        {
+            var bounds = new BBox( HandlerBase.ParseVector3( minStr ), HandlerBase.ParseVector3( maxStr ) );
+            clutter.InvalidateTilesInBounds( bounds );
+            return HandlerBase.Confirm(
+                $"Invalidated clutter tiles within ({bounds.Mins} → {bounds.Maxs}) on '{go.Name}'; they regenerate over subsequent frames." );
+        }
+
+        clutter.Generate();
+        return HandlerBase.Confirm( $"Regenerated all clutter on '{go.Name}'." );
+    }
+
+    private static object ClearClutter( Scene scene, JsonElement args )
+    {
+        var (clutter, go, error) = RequireClutter( scene, args, "clear_clutter" );
+        if ( clutter == null ) return error;
+
+        // Infinite (streamed) and volume clutter have separate clear paths;
+        // calling the wrong one leaves the scatter on screen and still reports success.
+        var infinite = clutter.Infinite;
+        if ( infinite ) clutter.ClearInfinite();
+        else clutter.Clear();
+
+        return HandlerBase.Confirm(
+            $"Cleared {( infinite ? "infinite-mode" : "volume" )} clutter on '{go.Name}'." );
+    }
+
+    /// <summary>
+    /// Resolve the ClutterComponent named by 'id'. Returns a null component plus
+    /// the error response to hand back when it cannot be found.
+    /// </summary>
+    private static (Sandbox.Clutter.ClutterComponent clutter, GameObject go, object error) RequireClutter(
+        Scene scene, JsonElement args, string action )
+    {
+        var id = HandlerBase.GetString( args, "id" );
+        if ( string.IsNullOrEmpty( id ) )
+            return ( null, null, HandlerBase.Error( "Missing required 'id' parameter.", action ) );
+
+        var go = SceneHelpers.FindByIdOrThrow( scene, id, action );
+        var clutter = go.Components.Get<Sandbox.Clutter.ClutterComponent>();
+        if ( clutter == null )
+            return ( null, go, HandlerBase.Error(
+                $"No ClutterComponent on '{go.Name}'.", action,
+                "Add one with component.add type='ClutterComponent'.",
+                null,
+                McpErrorCode.NotFound ) );
+
+        return ( clutter, go, null );
     }
 }

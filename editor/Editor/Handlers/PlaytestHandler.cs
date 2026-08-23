@@ -38,7 +38,8 @@ internal static class PlaytestHandler
         await GameTask.MainThread();
         var scenePath = HandlerBase.GetString( args, "scene_path" );
         if ( !string.IsNullOrWhiteSpace( scenePath ) )
-            SessionHandler.Handle( "load_scene", BuildArgs( new { action = "load_scene", path = scenePath } ) );
+            // [HANDOFF-TRUST: engine-fork-phase3-1-library-mvp Phase 3 — internal load_scene call from playtest.boot_scene does not need session identity (load_scene action ignores McpSession); passing null is safe for this surgical Phase 3 fix. Phase 4 may thread McpSession through PlaytestHandler.HandleAsync as part of the broader async-handler signature refactor.]
+            SessionHandler.Handle( "load_scene", BuildArgs( new { action = "load_scene", path = scenePath } ), null );
 
         // Guard: if the active scene is empty (0 GameObjects) we have likely
         // hit the post-asset-recompile blanking bug. Auto-reload from disk

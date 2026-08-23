@@ -41,7 +41,14 @@ internal static class VerifyChangeSetHandler
         var compileNeeded = profiles.Any( p => p is "sbep" or "gameplay" or "ui" or "networking" or "tools" );
         if ( compileNeeded )
         {
-            var compile = await PipelineHandler.HandleAsync( "compile_and_verify", BuildArgs( new { action = "compile_and_verify", skip_verify = !profiles.Contains( "sbep" ) } ) );
+            // compile-only: the dedicated sbep_verify.full_verify below (sbep
+            // profile) is the SINGLE authoritative SBEP verify. Previously
+            // skip_verify was !profiles.Contains("sbep"), so the sbep profile ran
+            // the pipeline's INTERNAL full_verify AND the standalone one below — the
+            // entity smoke test (clones every SBEP prefab, requires play mode) ran
+            // TWICE per change-set verify (editor-contention-reduction-plan.md
+            // Phase 1.3). Non-sbep profiles were already skip_verify=true.
+            var compile = await PipelineHandler.HandleAsync( "compile_and_verify", BuildArgs( new { action = "compile_and_verify", skip_verify = true } ) );
             steps.Add( new { check = "compile_and_verify", result = compile } );
         }
 

@@ -75,6 +75,31 @@ internal static class CursorStore
     }
 
     /// <summary>
+    /// Store a full JSON payload server-side and return ONLY the cursor id — no first page.
+    /// Used by pipeline step summaries (findings #6 payload diet): the step inlines a compact
+    /// summary and callers fetch the full sub-result via the 'continue' tool only when needed.
+    /// Same 60-second expiry as paged cursors; Offset starts at 0 so the first 'continue'
+    /// call delivers the payload from the beginning.
+    /// </summary>
+    internal static string StoreDetail( string fullJson, int pageSize = 0 )
+    {
+        PurgeExpired();
+
+        if ( pageSize <= 0 )
+            pageSize = HandlerBase.MaxResponseChars - 200;
+
+        var cursorId = Guid.NewGuid().ToString( "N" ).Substring( 0, 12 );
+        _store[cursorId] = new CursorEntry
+        {
+            FullJson = fullJson,
+            Offset = 0,
+            PageSize = pageSize,
+            CreatedAt = DateTime.UtcNow
+        };
+        return cursorId;
+    }
+
+    /// <summary>
     /// Get the next page for a cursor. Returns null if cursor not found or expired.
     /// </summary>
     internal static object GetNextPage( string cursorId )

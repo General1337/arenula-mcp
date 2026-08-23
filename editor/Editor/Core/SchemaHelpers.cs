@@ -88,8 +88,30 @@ internal static class SchemaHelpers
         GameObject go => new { id = go.Id.ToString(), name = go.Name, handle = SceneHelpers.BuildHandle( go ) },
         Component comp => new { id = comp.Id.ToString(), type = comp.GetType().Name, handle = SceneHelpers.BuildHandle( comp ) },
         Model model => model.ResourceName ?? model.ToString(),
+        // Particle wrappers have no useful ToString — without these the readback
+        // on every tuned particle field reads back as "Sandbox.ParticleFloat",
+        // which makes a set_property response impossible to verify by eye.
+        ParticleFloat pf => FormatParticleFloat( pf ),
+        ParticleVector3 pv => $"({FormatParticleFloat( pv.X )}, {FormatParticleFloat( pv.Y )}, {FormatParticleFloat( pv.Z )})",
+        ParticleGradient pg => FormatParticleGradient( pg ),
         IEnumerable enumerable when raw is not string => enumerable.Cast<object>().Take( 10 ).Select( FormatValue ).ToList(),
         _ => raw.ToString()
+    };
+
+    private static string FormatParticleFloat( ParticleFloat pf ) => pf.Type switch
+    {
+        ParticleFloat.ValueType.Constant   => $"Constant({MathF.Round( pf.ConstantValue, 4 )})",
+        ParticleFloat.ValueType.Range      => $"Range({MathF.Round( pf.ConstantA, 4 )},{MathF.Round( pf.ConstantB, 4 )})",
+        ParticleFloat.ValueType.Curve      => "Curve(<not-rendered>)",
+        ParticleFloat.ValueType.CurveRange => "CurveRange(<not-rendered>)",
+        _ => pf.Type.ToString()
+    };
+
+    private static string FormatParticleGradient( ParticleGradient pg ) => pg.Type switch
+    {
+        ParticleGradient.ValueType.Constant => $"Constant({pg.ConstantValue.Hex})",
+        ParticleGradient.ValueType.Range    => $"Range({pg.ConstantA.Hex},{pg.ConstantB.Hex})",
+        _ => pg.Type.ToString()
     };
 
     internal static string FormatTypeName( Type t )

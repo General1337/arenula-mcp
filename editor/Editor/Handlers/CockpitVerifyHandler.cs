@@ -10,21 +10,42 @@ using Sandbox;
 
 namespace Arenula;
 
+// Migrated to the [McpTool] attribute scan in mcp-dynamic-discovery Phase 3
+// Wave 3.1 — async tool (AsyncBeforeMainThread dispatch). Final-wave hardening
+// advertises both 'run' and the formerly hidden 'readiness' action so clients
+// never need to guess an operation that tools/list omitted.
+[McpTool( "cockpit_verify",
+	"Run the cockpit beauty verifier as a single orchestrated MCP call. Use action='run' to optionally restart play mode, ask the game-side cockpit diagnostic to select the runtime scene, invoke the cockpit beauty runner, poll FileSystem.Data artifacts, and return packet/rubric/AAA summary fields. Responses include handler_version and contract_version so wrappers can detect stale hotloaded MCP code. This tool is purpose-built to avoid long manual play/stop/log/artifact loops; it does not rebuild Blender assets." )]
 internal static class CockpitVerifyHandler
 {
     private const string HandlerVersion = "cockpit-verify-handler-2026-04-22-v3";
 
-    internal static async Task<object> HandleAsync( string action, JsonElement args )
+    /// <summary>
+    /// tools/list inputSchema fragment — verbatim copy of the legacy
+    /// <c>ToolRegistry.CockpitVerify.inputSchema</c> literal (mcp-dynamic-discovery
+    /// Phase 3). The scanner invokes this once at plugin load and caches it.
+    /// </summary>
+    internal static object InputSchema() => new
     {
-        return action switch
+        type = "object",
+        properties = new Dictionary<string, object>
         {
-            "readiness" => await Readiness( args ),
-            "run" => await Run( args ),
-            _ => HandlerBase.Error( $"Unknown cockpit_verify action '{action}'.", action, "Use action='readiness' or action='run'." )
-        };
-    }
+            ["action"] = new { type = "string", description = "The operation to perform.", @enum = new[] { "readiness", "run" } },
+            ["label"] = new { type = "string", description = "Run label used for FileSystem.Data/cockpit-beauty/<label>. Default: baseline." },
+            ["restart_play"] = new { type = "boolean", description = "Stop and start play before verifying. Default: true." },
+            ["timeout_seconds"] = new { type = "integer", description = "Maximum time to wait for readiness and artifacts. Default: 75." },
+            ["data_root"] = new { type = "string", description = "Absolute cockpit-beauty data root. Optional; default resolves sibling S&Box-Pub game data." }
+        },
+        required = new[] { "action" },
+        additionalProperties = false
+    };
 
-    private static async Task<object> Readiness( JsonElement args )
+    /// <summary>
+    /// 'readiness' action — advertised probe of the game-side cockpit diagnostic
+    /// without running a full beauty pass.
+    /// </summary>
+    [McpAction( "readiness", Threading = McpThreading.AsyncBeforeMainThread, ReadOnly = true )]
+    internal static async Task<object> Readiness( JsonElement args )
     {
         var timeoutSeconds = Math.Clamp( HandlerBase.GetInt( args, "timeout_seconds", 20 ), 1, 60 );
         var readiness = await WaitForGameDiagnostic( timeoutSeconds );
@@ -37,7 +58,13 @@ internal static class CockpitVerifyHandler
         } );
     }
 
-    private static async Task<object> Run( JsonElement args )
+    /// <summary>
+    /// 'run' action — full orchestrated cockpit beauty verification. Async
+    /// (AsyncBeforeMainThread): awaits the main thread internally when it needs
+    /// scene access. Lifecycle op — may restart play mode.
+    /// </summary>
+    [McpAction( "run", Threading = McpThreading.AsyncBeforeMainThread, LifecycleKind = "lifecycle" )]
+    internal static async Task<object> Run( JsonElement args )
     {
         var label = SanitizeLabel( HandlerBase.GetString( args, "label", "baseline" ) );
         var restartPlay = HandlerBase.GetBool( args, "restart_play", true );
@@ -545,13 +572,126 @@ internal static class CockpitVerifyHandler
         "world_chair_identity.png"
     };
 
+    /// <summary>
+    /// Resolve the game's FileSystem.Data cockpit-beauty directory.
+    ///
+    /// DERIVED, NEVER DECLARED. This method used to hardcode
+    ///     &lt;sibling&gt;/S&amp;Box-Pub/game/data/softsplit/sandbox#local/cockpit-beauty
+    /// which broke silently when the project Org was renamed softsplit -> general1337:
+    /// the game wrote to the new root, this polled the old one, and every
+    /// cockpit_verify run ended in `status: "timeout"` while 225 stale pre-rebrand
+    /// PNGs sat in the directory it was watching.
+    ///
+    /// BOTH halves of the old literal were wrong-by-construction: the engine
+    /// checkout (the running editor may be any worktree) and the Org segment
+    /// (renamable in sandbox.sbproj). So both are now read from the live system:
+    ///     editor dir : from the process we are executing inside
+    ///     Org/Ident  : parsed from the project's .sbproj
+    /// A rename or a build switch is followed automatically from here on.
+    /// tools/capture.py performs the identical derivation host-side.
+    ///
+    /// Every fallback below LOGS why it fired. A path resolver that degrades
+    /// silently is precisely the failure this method is being fixed for.
+    /// </summary>
     private static string ResolveCockpitDataRoot()
     {
+        const string LeafDir = "cockpit-beauty";
         var root = HandlerBase.GetProjectRoot();
-        if ( string.IsNullOrEmpty( root ) )
-            return Path.Combine( Environment.CurrentDirectory, "cockpit-beauty" );
-        var sibling = Directory.GetParent( root )?.FullName ?? root;
-        return Path.Combine( sibling, "S&Box-Pub", "game", "data", "softsplit", "sandbox#local", "cockpit-beauty" );
+
+        var editorDir = ResolveEditorGameDir();
+        if ( !string.IsNullOrEmpty( editorDir ) )
+        {
+            var (org, ident) = ReadOrgIdent( root );
+            if ( !string.IsNullOrEmpty( org ) && !string.IsNullOrEmpty( ident ) )
+            {
+                // Returned even if it does not exist yet: the game creates it on the
+                // first capture, and watching the correct directory from the start is
+                // the entire point.
+                return Path.Combine( editorDir, "data", org, $"{ident}#local", LeafDir );
+            }
+
+            Log.Warning( $"[cockpit_verify] Could not read Org/Ident from a .sbproj under '{root}'. " +
+                         "Falling back to a directory search; pass data_root explicitly if this misses." );
+        }
+        else
+        {
+            Log.Warning( "[cockpit_verify] Could not resolve the running editor directory. " +
+                         "Falling back to a directory search." );
+        }
+
+        if ( !string.IsNullOrEmpty( root ) )
+        {
+            var searchBase = Directory.GetParent( root )?.FullName ?? root;
+            try
+            {
+                var found = Directory.EnumerateDirectories( searchBase, LeafDir, SearchOption.AllDirectories )
+                    .OrderByDescending( Directory.GetLastWriteTimeUtc )
+                    .FirstOrDefault();
+                if ( !string.IsNullOrEmpty( found ) )
+                {
+                    Log.Warning( $"[cockpit_verify] Using most-recently-written '{LeafDir}' found by search: {found}. " +
+                                 "This is a DEGRADED path — it may be a stale pre-rebrand directory." );
+                    return found;
+                }
+            }
+            catch ( Exception ex )
+            {
+                Log.Warning( $"[cockpit_verify] Directory search under '{searchBase}' failed: {ex.Message}" );
+            }
+        }
+
+        var cwd = Path.Combine( Environment.CurrentDirectory, LeafDir );
+        Log.Warning( $"[cockpit_verify] All resolution strategies failed; using CWD fallback '{cwd}'. " +
+                     "cockpit_verify will almost certainly time out — pass data_root explicitly." );
+        return cwd;
+    }
+
+    /// <summary>The `game` directory of the editor process we are running inside.</summary>
+    private static string ResolveEditorGameDir()
+    {
+        try
+        {
+            var exe = System.Diagnostics.Process.GetCurrentProcess().MainModule?.FileName;
+            if ( !string.IsNullOrEmpty( exe ) )
+            {
+                var dir = Path.GetDirectoryName( exe );
+                if ( !string.IsNullOrEmpty( dir ) )
+                    return dir;
+            }
+        }
+        catch ( Exception ex )
+        {
+            Log.Warning( $"[cockpit_verify] MainModule probe failed ({ex.Message}); using AppContext.BaseDirectory." );
+        }
+
+        var baseDir = AppContext.BaseDirectory;
+        return string.IsNullOrEmpty( baseDir ) ? null : baseDir.TrimEnd( Path.DirectorySeparatorChar );
+    }
+
+    /// <summary>Org/Ident straight out of the project's .sbproj — never assumed.</summary>
+    private static (string Org, string Ident) ReadOrgIdent( string projectRoot )
+    {
+        if ( string.IsNullOrEmpty( projectRoot ) )
+            return (null, null);
+
+        try
+        {
+            var sbproj = Directory.EnumerateFiles( projectRoot, "*.sbproj", SearchOption.TopDirectoryOnly )
+                .FirstOrDefault();
+            if ( string.IsNullOrEmpty( sbproj ) )
+                return (null, null);
+
+            using var doc = JsonDocument.Parse( File.ReadAllText( sbproj ) );
+            var rootEl = doc.RootElement;
+            var org = rootEl.TryGetProperty( "Org", out var o ) ? o.GetString() : null;
+            var ident = rootEl.TryGetProperty( "Ident", out var i ) ? i.GetString() : null;
+            return (org, ident);
+        }
+        catch ( Exception ex )
+        {
+            Log.Warning( $"[cockpit_verify] Failed to parse .sbproj under '{projectRoot}': {ex.Message}" );
+            return (null, null);
+        }
     }
 
     private static string SanitizeLabel( string label )

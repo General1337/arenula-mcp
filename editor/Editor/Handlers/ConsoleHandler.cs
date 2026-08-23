@@ -6,19 +6,20 @@ using System.Reflection;
 using System.Text.Json;
 using System.Threading.Tasks;
 using Sandbox;
+// Alias rather than `using Editor;` — Editor.ConsoleSystem would make every bare
+// ConsoleSystem reference in this file ambiguous (CS0104).
+using SceneEditorSession = Editor.SceneEditorSession;
 
 namespace Arenula;
 
 /// <summary>
 /// Console actions for the editor tool: console_list, console_run.
 /// console_run auto-detects ConVar (get/set) vs ConCmd (execute + capture output).
-/// ConCmd execution runs on main thread and captures log output for the response.
+/// ConCmd execution runs through the engine console registry on the main thread
+/// and captures log output for the response.
 /// </summary>
 internal static class ConsoleHandler
 {
-    // Lazy cache of ConCmd methods, keyed by command name
-    private static Dictionary<string, MethodInfo> _conCmdCache;
-
     internal static async Task<object> HandleAsync( string action, JsonElement args )
     {
         try
@@ -144,6 +145,7 @@ internal static class ConsoleHandler
             return HandlerBase.Error( "Missing required 'command' parameter.", "console_run" );
 
         var waitMs = HandlerBase.GetInt( args, "wait_ms", 100 );
+        var bindScene = HandlerBase.GetBool( args, "bind_scene", true );
 
         var parts = command.Trim().Split( ' ', StringSplitOptions.RemoveEmptyEntries );
         if ( parts.Length == 0 )
@@ -171,94 +173,68 @@ internal static class ConsoleHandler
             return HandlerBase.Text( $"Set {cmdName} = {readback ?? newValue}" );
         }
 
-        // Path 2: ConCmd — execute and capture log output
-        var method = ResolveConCmd( cmdName );
-        if ( method != null )
-        {
-            return await ExecuteConCmd( cmdName, parts, method, waitMs );
-        }
-
-        // Path 3: Try ConsoleSystem.Run as last resort (catches engine-registered commands)
-        return await TryRunRaw( command, waitMs );
+        // Path 2: ConCmd — execute through the engine registry.
+        //
+        // Do not prefer MCP reflection here. Hotloaded game assemblies can leave old
+        // MethodInfo instances loaded in the AppDomain even after a clean compile and
+        // successful TypeLibrary probe; invoking them directly makes already-named
+        // commands such as sbep.dev keep running stale IL. ConsoleSystem.Run follows
+        // the engine's current ConCmd/ConVar registry, including full-hotload fallback
+        // re-registration, so it is the authoritative dispatch path.
+        return await TryRunRaw( command, waitMs, bindScene );
     }
 
-    private static async Task<object> ExecuteConCmd(
-        string cmdName, string[] parts, MethodInfo method, int waitMs )
+    private static async Task<object> TryRunRaw( string command, int waitMs, bool bindScene )
     {
         EditorHandler.EnsureInitialized();
         var before = EditorHandler.LogSnapshotText();
 
+        string sceneBound = null;
+        bool sceneIsPlaySession = false;
+
         try
         {
-            // Switch to main thread for scene access
             await GameTask.MainThread();
 
-            // Build arguments — skip Connection parameters (editor has no player connection)
-            var parameters = method.GetParameters();
-            var invokeArgs = new List<object>();
-            int argIndex = 1; // parts[0] is the command name
-
-            foreach ( var param in parameters )
+            // Bind the live session scene so the ConCmd body sees a valid Game.ActiveScene
+            // (findings.md #1 item 3 / AP-061: the tools-context ActiveScene is stale or
+            // null for ~30s after a compile/hotload, so handlers calling
+            // Game.ActiveScene.GetAllComponents<T>() silently no-op or throw).
+            //
+            // Why this works — verified against engine source (fork worktree
+            // SBox-Pub-hotload-full-fallback):
+            //   * Scene.Push() is PUBLIC (Scene.cs:156) — sets Game.ActiveScene + scene
+            //     Time for the scope, restores on Dispose, main-thread asserted.
+            //   * ConsoleSystem.Run → RunInternal → ConVarSystem.RunSingle →
+            //     ManagedCommand method.Invoke (Command.cs:246) is fully SYNCHRONOUS on
+            //     this thread, so the Push scope covers the entire ConCmd body.
+            //   * During play, SceneEditorSession.Active.Scene IS the play-mode clone
+            //     (same source PipelineHandler relies on for IsPlaying / save-skip).
+            Scene targetScene = null;
+            if ( bindScene )
             {
-                if ( param.ParameterType == typeof( Connection ) )
+                var session = SceneEditorSession.Active;
+                targetScene = session?.Scene;
+                sceneIsPlaySession = session?.IsPlaying == true;
+                if ( targetScene == null )
                 {
-                    invokeArgs.Add( null );
-                    continue;
-                }
-
-                if ( argIndex < parts.Length )
-                {
-                    invokeArgs.Add( ConvertArg( parts[argIndex], param.ParameterType ) );
-                    argIndex++;
-                }
-                else if ( param.HasDefaultValue )
-                {
-                    invokeArgs.Add( param.DefaultValue );
-                }
-                else
-                {
-                    return HandlerBase.Error(
-                        $"ConCmd '{cmdName}' requires parameter '{param.Name}' ({param.ParameterType.Name}).",
-                        "console_run" );
+                    targetScene = Game.ActiveScene;
+                    sceneIsPlaySession = false;
                 }
             }
 
-            method.Invoke( null, invokeArgs.ToArray() );
-        }
-        catch ( TargetInvocationException ex )
-        {
-            return HandlerBase.Error( $"ConCmd '{cmdName}' threw: {ex.InnerException?.Message ?? ex.Message}", "console_run" );
-        }
-        catch ( Exception ex )
-        {
-            return HandlerBase.Error( $"ConCmd '{cmdName}' error: {ex.Message}", "console_run" );
-        }
-
-        // Wait for async log output
-        if ( waitMs > 0 )
-            await Task.Delay( Math.Clamp( waitMs, 0, 5000 ) );
-
-        var after = EditorHandler.LogSnapshotText();
-        var newLines = after.Skip( before.Length ).ToArray();
-
-        return HandlerBase.Success( new
-        {
-            command = cmdName,
-            kind = "concmd",
-            output_lines = newLines.Length,
-            output = newLines
-        } );
-    }
-
-    private static async Task<object> TryRunRaw( string command, int waitMs )
-    {
-        EditorHandler.EnsureInitialized();
-        var before = EditorHandler.LogSnapshotText();
-
-        try
-        {
-            await GameTask.MainThread();
-            ConsoleSystem.Run( command );
+            if ( targetScene != null )
+            {
+                using ( targetScene.Push() )
+                {
+                    ConsoleSystem.Run( command );
+                }
+                sceneBound = targetScene.Name;
+            }
+            else
+            {
+                ConsoleSystem.Run( command );
+            }
         }
         catch ( Exception ex )
         {
@@ -278,57 +254,13 @@ internal static class ConsoleHandler
         {
             command,
             kind = "raw",
+            scene_bound = sceneBound,
+            scene_is_play_session = sceneIsPlaySession,
             output_lines = newLines.Length,
             output = newLines
         } );
     }
 
-    // ── ConCmd reflection cache ──────────────────────────────────────────
-
-    private static MethodInfo ResolveConCmd( string cmdName )
-    {
-        if ( _conCmdCache == null )
-            BuildConCmdCache();
-
-        _conCmdCache.TryGetValue( cmdName.ToLowerInvariant(), out var method );
-        return method;
-    }
-
-    /// <summary>Call after recompilation to rebuild the ConCmd cache.</summary>
-    internal static void InvalidateCache() => _conCmdCache = null;
-
-    private static void BuildConCmdCache()
-    {
-        _conCmdCache = new( StringComparer.OrdinalIgnoreCase );
-
-        foreach ( var asm in AppDomain.CurrentDomain.GetAssemblies() )
-        {
-            try
-            {
-                foreach ( var type in asm.GetTypes() )
-                {
-                    foreach ( var method in type.GetMethods(
-                        BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Static ) )
-                    {
-                        var attr = method.GetCustomAttributes( typeof( ConCmdAttribute ), false )
-                            .FirstOrDefault() as ConCmdAttribute;
-                        if ( attr == null ) continue;
-
-                        var name = ( attr.Name ?? method.Name ).ToLowerInvariant();
-                        _conCmdCache.TryAdd( name, method );
-                    }
-                }
-            }
-            catch { }
-        }
-    }
-
-    private static object ConvertArg( string value, Type targetType )
-    {
-        if ( targetType == typeof( string ) ) return value;
-        if ( targetType == typeof( int ) ) return int.TryParse( value, out var i ) ? i : 0;
-        if ( targetType == typeof( float ) ) return float.TryParse( value, out var f ) ? f : 0f;
-        if ( targetType == typeof( bool ) ) return value is "1" or "true" or "True";
-        return value;
-    }
+    /// <summary>Kept for compile pipeline compatibility; console_run no longer caches reflected ConCmd methods.</summary>
+    internal static void InvalidateCache() { }
 }

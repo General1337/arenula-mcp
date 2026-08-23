@@ -2,6 +2,7 @@
 using System;
 using System.Collections.Generic;
 using System.Text.Json;
+using System.Threading.Tasks;
 
 namespace Arenula;
 
@@ -10,28 +11,65 @@ namespace Arenula;
 /// Each operation specifies a tool name, action, and params object.
 /// Results are collected into an array and returned together.
 /// </summary>
+// Migrated to the [McpTool] attribute scan in mcp-dynamic-discovery Phase 3
+// Wave 3.1 — single-action tool. Its [McpAction] uses the 2-arg
+// (JsonElement, McpSession) handler form (the scanner signature contract was
+// extended this wave): batch's execute dispatch can route a session.identify
+// sub-op that needs the live McpSession.
+//
+// mcp-batch-async-session-identify (findings.md #7, 2026-06-11): execute is now
+// ASYNC (Threading=AsyncBeforeMainThread) and routes per-op through
+// ToolDispatchSteps.RunStepAsync, so async tools (compile.check, verify chains,
+// qa, playtest, ...) compose inside one batch — only batch-inside-batch
+// recursion is rejected. Tool description + InputSchema literals are UNCHANGED
+// on purpose: they must stay byte-identical to
+// ToolRegistry.MigratedToolLiterals["batch"] (sbep.test_mcp_tools_list_parity).
+// [PERF-OK: mechanical McpTool attribute migration, mcp-dynamic-discovery Wave 3.1 — no hot-path change; the verbatim batch tool-description string contains the phrase reduce round-trips, which tripped the perf-gate keyword scan.]
+[McpTool( "batch",
+	"Execute multiple tool operations in a single request. Provide a JSON array of operations, each specifying a tool name, action, and parameters. Operations execute sequentially and results are collected into an array. Use this to reduce round-trips when performing many related changes (e.g. creating multiple objects, setting multiple properties). If any operation fails, subsequent operations still execute — check individual results for errors." )]
 internal static class BatchHandler
 {
-    internal static object Handle( string action, JsonElement args )
+    /// <summary>
+    /// 'execute' action handler. Async 2-arg [McpAction] form — the dispatcher
+    /// invokes without awaiting MainThread first and threads the live
+    /// <see cref="McpSession"/> in; each sub-step hops threads as its own
+    /// handler requires (ToolDispatchSteps). The try/catch preserves the legacy
+    /// <c>HandlerBase.Error</c> response shape — the pre-migration
+    /// <c>Handle()</c> switch wrapped the execute path likewise.
+    /// </summary>
+    [McpAction( "execute", LifecycleKind = "lifecycle", Threading = McpThreading.AsyncBeforeMainThread )]
+    internal static async Task<object> HandleExecuteAsync( JsonElement args, McpSession session )
     {
         try
         {
-            return action switch
-            {
-                "execute" => Execute( args ),
-                _ => HandlerBase.Error( $"Unknown action '{action}'", action,
-                    "Valid actions: execute" )
-            };
+            return await ExecuteAsync( args, session );
         }
         catch ( Exception ex )
         {
-            return HandlerBase.Error( ex.Message, action );
+            return HandlerBase.Error( ex.Message, "execute" );
         }
     }
 
+    /// <summary>
+    /// tools/list inputSchema fragment — verbatim copy of the legacy
+    /// <c>ToolRegistry.Batch.inputSchema</c> literal (mcp-dynamic-discovery Phase 3).
+    /// </summary>
+    internal static object InputSchema() => new
+    {
+        type = "object",
+        properties = new Dictionary<string, object>
+        {
+            ["action"] = new { type = "string", description = "The operation to perform.", @enum = new[] { "execute" } },
+            ["operations"] = new { type = "string", description = "JSON array of operations. Each element: {\"tool\": \"gameobject\", \"action\": \"destroy\", \"params\": {\"id\": \"...\"}}. Required for: execute." }
+        },
+        required = new[] { "action" },
+        additionalProperties = false
+    };
+
     // ── execute ─────────────────────────────────────────────────────────
 
-    private static object Execute( JsonElement args )
+    // [HANDOFF-TRUST: engine-fork-phase3-1-library-mvp Phase 3 — Execute signature gains McpSession to thread through to dispatch; no inherited handoff hypothesis applies.]
+    private static async Task<object> ExecuteAsync( JsonElement args, McpSession session )
     {
         var opsJson = HandlerBase.GetString( args, "operations" );
         if ( string.IsNullOrEmpty( opsJson ) )
@@ -82,12 +120,12 @@ internal static class BatchHandler
 
             try
             {
-                var opResult = DispatchToHandler( tool, opAction, merged );
+                // mcp-batch-async-session-identify: async-capable step dispatch —
+                // compile/verify chains compose; only batch→batch recursion throws.
+                var opResult = await ToolDispatchSteps.RunStepAsync( tool, opAction, merged, session );
                 results.Add( new { tool, action = opAction, result = opResult } );
 
-                // Check if the result is an error by inspecting for isError field
-                var resultJson = JsonSerializer.Serialize( opResult );
-                if ( resultJson.Contains( "\"isError\":true" ) )
+                if ( McpResult.IsErrorResult( opResult ) )
                     errorCount++;
                 else
                     successCount++;
@@ -110,41 +148,21 @@ internal static class BatchHandler
     }
 
     /// <summary>
-    /// Dispatches a single operation to the appropriate handler.
-    /// Mirrors the routing logic in RpcDispatcher for main-thread tools.
+    /// SYNC dispatch — retained for the sync main-thread callers
+    /// (OperationHandler.Apply, TransactionHandler.Apply). batch.execute itself
+    /// no longer routes here (it uses ToolDispatchSteps.RunStepAsync, which
+    /// composes async tools). The async-tool throw messages below are preserved
+    /// verbatim for those existing callers; all other routing delegates to the
+    /// single shared switch in <see cref="ToolDispatchSteps.RunSyncStep"/>.
     /// </summary>
-    internal static object DispatchToHandler( string tool, string action, JsonElement args )
+    internal static object DispatchToHandler( string tool, string action, JsonElement args, McpSession session )
     {
         return tool switch
         {
-            "scene"        => SceneHandler.Handle( action, args ),
-            "gameobject"   => GameObjectHandler.Handle( action, args ),
-            "component"    => ComponentHandler.Handle( action, args ),
-            "prefab"       => PrefabHandler.Handle( action, args ),
-            "asset_query"  => AssetQueryHandler.Handle( action, args ),
-            "asset_manage" => AssetManageHandler.Handle( action, args ),
-            "editor"       => EditorHandler.Handle( action, args ),
-            "mesh"         => MeshHandler.Handle( action, args ),
-            "lighting"     => LightingHandler.Handle( action, args ),
-            "physics"      => PhysicsHandler.Handle( action, args ),
-            "audio"        => AudioHandler.Handle( action, args ),
-            "effects"      => EffectsHandler.Handle( action, args ),
-            "camera"       => CameraHandler.Handle( action, args ),
-            "navmesh"      => NavmeshHandler.Handle( action, args ),
-            "session"      => SessionHandler.Handle( action, args ),
-            "project"      => ProjectHandler.Handle( action, args ),
-            "terrain"      => TerrainHandler.Handle( action, args ),
-            "trace"        => TraceHandler.Handle( action, args ),
-            "cross_index"  => CrossIndexHandler.Handle( action, args ),
-            "autofix"      => AutofixHandler.Handle( action, args ),
-            "transaction"  => TransactionHandler.Handle( action, args ),
-            "compile"      => throw new InvalidOperationException( "Tool 'compile' is async and cannot be used in batch operations." ),
-            "cloud"        => throw new InvalidOperationException( "Tool 'cloud' is async and cannot be used in batch operations." ),
-            "workflow"     => throw new InvalidOperationException( "Tool 'workflow' is async and cannot be used in batch operations." ),
-            "verify_change_set" => throw new InvalidOperationException( "Tool 'verify_change_set' is async and cannot be used in batch operations." ),
-            "playtest"     => throw new InvalidOperationException( "Tool 'playtest' is async and cannot be used in batch operations." ),
-            "batch"        => throw new InvalidOperationException( "Nested batch operations are not supported." ),
-            _ => throw new InvalidOperationException( $"Tool '{tool}' not found" )
+            "compile" or "cloud" or "workflow" or "verify_change_set" or "playtest"
+                => throw new InvalidOperationException( $"Tool '{tool}' is async and cannot be used in batch operations." ),
+            "batch" => throw new InvalidOperationException( "Nested batch operations are not supported." ),
+            _ => ToolDispatchSteps.RunSyncStep( tool, action, args, session )
         };
     }
 

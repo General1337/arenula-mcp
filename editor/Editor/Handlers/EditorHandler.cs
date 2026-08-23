@@ -39,7 +39,6 @@ internal static class EditorHandler
     // (stack traces are the dominant cost). 2000 is 4x the legacy cap, ~20% of the
     // engine Console widget's 10000, and comfortably holds a full play session.
     private static readonly System.Collections.Concurrent.ConcurrentQueue<McpLogEntry> _log = new();
-    private static bool _initialized;
     private static bool _callbackFaulted;
 
     [ConVar( "mcp_log_cap", ConVarFlags.Saved, Help = "Max entries retained in the MCP structured log buffer." )]
@@ -53,19 +52,35 @@ internal static class EditorHandler
     /// </summary>
     internal static void EnsureInitialized()
     {
-        if ( _initialized ) return;
-        _initialized = true;
+        // 2026-07-12 friction-audit self-heal: do NOT gate registration behind the
+        // static bool alone — hot-reload MIGRATES `_initialized = true` into the
+        // fresh assembly while the fresh ring + fresh OnEngineLog delegate start
+        // UNREGISTERED, so get_log goes permanently dark until an editor restart
+        // (AP static-flag-guarded-logger-registration-leaks-per-hotload; FeedHandler
+        // was cured of the same disease on 2026-07-09, this handler was not —
+        // observed live 2026-07-12: ring held only MCP-op chatter, total=5).
+        //
+        // Cure: every MAIN-THREAD entry defensively re-registers (RemoveLogger is
+        // an idempotent no-op when not subscribed, so no double-delivery), which
+        // makes a reload-broken ring self-heal on the next get_log / console_run.
+        // Off-main-thread callers (mcp.health answers on the HTTP thread) skip
+        // registration entirely because AddLogger/RemoveLogger is not proven
+        // thread-safe (see RpcDispatcher.cs) — the next main-thread call heals.
+        // Engine source: S&Box-Pub/engine/Sandbox.System (ThreadSafe.IsMainThread).
+        if ( !ThreadSafe.IsMainThread )
+            return;
 
         // Canonical engine log feed (EditorUtility.AddLogger is what ConsoleWidget uses).
         // Defensive RemoveLogger first — idempotent, no-op if not currently subscribed —
-        // so hot-reload cycles that clear _initialized without tearing down the old
-        // subscription don't cause double-delivery.
+        // so re-entry and hot-reload cycles don't cause double-delivery.
         try { EditorUtility.RemoveLogger( OnEngineLog ); } catch { }
         EditorUtility.AddLogger( OnEngineLog );
 
         // MCP server internal logs (SSE connections, RPC dispatches). These also
         // fire through Log.* and therefore arrive via OnEngineLog too — we keep
         // both so the 'mcp' source tag makes server-internal entries easy to filter.
+        // Defensive -= mirrors the RemoveLogger above — idempotent, never stacks.
+        ArenulaMcpServer.OnLogMessage -= AppendLogFromMcpServer;
         ArenulaMcpServer.OnLogMessage += AppendLogFromMcpServer;
     }
 
@@ -182,7 +197,9 @@ internal static class EditorHandler
                 "start_play"       => StartPlay(),
                 "stop_play"        => StopPlay(),
                 "get_log"          => GetLog( args ),
-                "save_scene"       => SaveScene(),
+                "get_hotload_summary" => GetHotloadSummary( args ),
+                "save_scene"       => SaveScene( args ),
+                "save_all"         => SaveAll( args ),
                 "save_scene_as"    => SaveSceneAs( args ),
                 "undo"             => Undo(),
                 "redo"             => Redo(),
@@ -194,12 +211,13 @@ internal static class EditorHandler
                 "restart_mcp"      => RestartMcp(),
                 "reload_scene"     => ReloadScene( args ),
                 _ => HandlerBase.Error( $"Unknown action '{action}'", action,
-                    "Valid actions: select, get_selected, set_selected, clear_selection, frame_selection, get_play_state, start_play, stop_play, get_log, save_scene, save_scene_as, undo, redo, open_code_file, get_preferences, set_preference, restart_mcp, reload_scene" )
+                    "Valid actions: select, get_selected, set_selected, clear_selection, frame_selection, get_play_state, start_play, stop_play, get_log, get_hotload_summary, save_scene, save_scene_as, undo, redo, open_code_file, get_preferences, set_preference, restart_mcp, reload_scene",
+                    null, McpErrorCode.UnknownAction )
             };
         }
         catch ( Exception ex )
         {
-            return HandlerBase.Error( ex.Message, action );
+            return HandlerBase.Error( ex.Message, action, null, null, McpErrorCode.InternalException );
         }
     }
 
@@ -392,6 +410,10 @@ internal static class EditorHandler
     //   offset — pagination offset after trim/filter
     //   limit  — pagination page size (default 50)
     //   format — "structured" (default) or "text" for legacy [HH:mm:ss] msg shape
+    //   include_stacks — default FALSE (findings #6 payload diet): inline stack traces
+    //                    are ~2KB per item, so count=200 shipped 250KB+ payloads. The
+    //                    envelope reports stacksOmitted so agents know a re-call with
+    //                    include_stacks=true will surface them.
 
     private static object GetLog( JsonElement args )
     {
@@ -402,6 +424,7 @@ internal static class EditorHandler
         var offset = HandlerBase.GetInt(    args, "offset", 0  );
         var limit  = HandlerBase.GetInt(    args, "limit",  50 );
         var format = HandlerBase.GetString( args, "format"     ) ?? "structured";
+        var includeStacks = HandlerBase.GetBool( args, "include_stacks", false );
 
         var bufferSize = _log.Count;
         var entries = _log.ToArray();
@@ -440,6 +463,11 @@ internal static class EditorHandler
 
         bool textFormat = string.Equals( format, "text", StringComparison.OrdinalIgnoreCase );
 
+        // Stacks are opt-in: null fields are dropped by the serializer, so the default
+        // response carries no stack keys at all. stacksOmitted tells the agent how many
+        // entries in this page have a trace available behind include_stacks=true.
+        int stacksOmitted = includeStacks ? 0 : page.Count( e => !string.IsNullOrEmpty( e.Stack ) );
+
         object items = textFormat
             ? (object) page.Select( FormatEntry ).ToList()
             : (object) page.Select( e => new
@@ -448,7 +476,7 @@ internal static class EditorHandler
                     level   = e.Level,
                     logger  = e.Logger,
                     message = e.Message,
-                    stack   = string.IsNullOrEmpty( e.Stack ) ? null : e.Stack,
+                    stack   = includeStacks && !string.IsNullOrEmpty( e.Stack ) ? e.Stack : null,
                     source  = e.Source,
                     repeats = e.Repeats
                 } ).ToList();
@@ -463,19 +491,160 @@ internal static class EditorHandler
             has_more   = offset + effectiveLimit < total,
             bufferSize,
             bufferCap  = LogCap,
-            format     = textFormat ? "text" : "structured"
+            format     = textFormat ? "text" : "structured",
+            stacksOmitted = stacksOmitted > 0 ? stacksOmitted : (int?)null
+        } );
+    }
+
+    // ── get_hotload_summary ──────────────────────────────────────────────
+    // Per-generation hotload-result snapshots from HotReloadProbe. Useful for the
+    // /diagnose-stale-dll protocol (replaces "scan engine log for upgrade warnings"
+    // ad-hoc step) and the /audit health check (returns currentGeneration so callers
+    // can detect "MCP plugin is stale, restart editor" — currentGeneration that hasn't
+    // advanced after a known compile is the signal).
+    //
+    // Engine offers no public access path to live Sandbox.HotloadResult instances
+    // (verified 2026-05-09 via mcp__sbox-editor__reflection probes — no static
+    // accessor on Sandbox.Hotload, [EditorEvent.Hotload] is parameterless). Snapshot
+    // payload is therefore log-derived and intentionally compact.
+    //
+    // Params:
+    //   count — trim to last N snapshots before filtering (default = all, max = cap)
+    //   level — comma-separated status filter ("errors" or "warnings,errors")
+    private static object GetHotloadSummary( JsonElement args )
+    {
+        var count = HandlerBase.GetInt(    args, "count", 0 );
+        var level = HandlerBase.GetString( args, "level"    );
+
+        var snaps = HotReloadProbe.RecentResults();
+        // Newest first for the response.
+        var arr = new HotReloadProbe.HotloadResultSnapshot[snaps.Count];
+        for ( int i = 0; i < snaps.Count; i++ ) arr[i] = snaps[snaps.Count - 1 - i];
+
+        if ( !string.IsNullOrEmpty( level ) )
+        {
+            var wanted = level.Split( ',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries )
+                .Select( s => s.ToLowerInvariant() ).ToHashSet();
+            arr = arr.Where( s => wanted.Contains( ( s.Status ?? "" ).ToLowerInvariant() ) ).ToArray();
+        }
+
+        if ( count > 0 && count < arr.Length )
+            arr = arr[..count];
+
+        var items = arr.Select( s => new
+        {
+            generation        = s.Generation,
+            utc               = s.Utc.ToString( "yyyy-MM-ddTHH:mm:ss.fffZ" ),
+            status            = s.Status,
+            warningTokens     = s.WarningTokens,
+            failedTypes       = s.FailedTypes,
+            scanWallMs        = Math.Round( s.ScanWallMs, 3 ),
+            logEntriesScanned = s.LogEntriesScanned
+        } ).ToList();
+
+        return HandlerBase.Success( new
+        {
+            ok                = true,
+            currentGeneration = HotReloadProbe.Generation,
+            lastHotloadUtc    = HotReloadProbe.LastHotloadUtc == DateTime.MinValue
+                                  ? null
+                                  : HotReloadProbe.LastHotloadUtc.ToString( "yyyy-MM-ddTHH:mm:ss.fffZ" ),
+            total             = snaps.Count,
+            cap               = HotReloadProbe.RecentResultsCap,
+            recent            = items
         } );
     }
 
     // ── save_scene ───────────────────────────────────────────────────────
-    // Ported from OzmiumWriteHandlers.SaveScene
+    // Ported from OzmiumWriteHandlers.SaveScene.
+    // Integrity-guarded 2026-06-11 (findings #5): SceneEditorSession.Save serializes
+    // whatever is in memory — after a stale/partial reload that has destroyed
+    // thousands of disk lines (2x ~8K-line losses, 2026-05-02). Refuse to write
+    // when (a) a reload hold exists for this scene, or (b) the in-memory object
+    // count is dramatically below the parsed disk count. force:true overrides both.
 
-    private static object SaveScene()
+    private static object SaveScene( JsonElement args )
     {
         var session = SceneEditorSession.Active;
-        if ( session == null ) return HandlerBase.Error( "No editor session active.", "save_scene" );
+        if ( session == null )
+            return HandlerBase.Error( "No editor session active.", "save_scene", null, null, McpErrorCode.NoActiveSession );
+
+        var force = HandlerBase.GetBool( args, "force", false );
+        var scenePath = TryGetScenePath( session );
+        var live = SceneIntegrityGuard.CountLive( session.Scene );
+
+        SceneIntegrityGuard.DiskSnapshot disk = null;
+        if ( !string.IsNullOrEmpty( scenePath ) )
+            disk = SceneIntegrityGuard.SnapshotDisk( SceneIntegrityGuard.ResolveAbsolutePath( scenePath ) );
+
+        if ( !force )
+        {
+            // Tripwire from a prior reload_scene whose verdict was partial_load /
+            // disk_overwritten — refuse regardless of counts.
+            if ( SceneIntegrityGuard.TryGetHold( scenePath, out var hold ) )
+            {
+                return HandlerBase.Error(
+                    $"REFUSED: a reload of '{scenePath}' at {hold.PlacedUtc:HH:mm:ss}Z returned '{hold.Reason}' " +
+                    $"({hold.MemoryGameObjects}/{hold.DiskGameObjects} GameObjects loaded). Writing now would serialize " +
+                    $"that incomplete in-memory state over the disk file.",
+                    "save_scene",
+                    "Re-run editor.reload_scene until integrity.verified=true (stop play mode first; let the asset " +
+                    "watcher reimport the disk edit). If you are CERTAIN the in-memory state is what you want on disk, " +
+                    "pass force:true.",
+                    new
+                    {
+                        holdReason = hold.Reason,
+                        holdPlacedUtc = hold.PlacedUtc.ToString( "yyyy-MM-ddTHH:mm:ssZ" ),
+                        diskGameObjects = hold.DiskGameObjects,
+                        memoryGameObjects = hold.MemoryGameObjects
+                    },
+                    McpErrorCode.SaveRefusedIntegrityHold );
+            }
+
+            // Stateless integrity assertion: in-memory count must not be dramatically
+            // below what the disk file holds. memory > disk is normal (prefab
+            // expansion, MCP-created objects) and never blocks.
+            if ( disk is { Parsed: true } )
+            {
+                int goDeficit = disk.GameObjectCount - live.GameObjects;
+                int goThreshold = SceneIntegrityGuard.SaveDeficitThreshold( disk.GameObjectCount );
+                int compDeficit = disk.ComponentCount - live.Components;
+                int compThreshold = Math.Max( 5, disk.ComponentCount / 10 );
+                if ( goDeficit > goThreshold || compDeficit > compThreshold )
+                {
+                    return HandlerBase.Error(
+                        $"REFUSED: in-memory scene holds {live.GameObjects} GameObjects / {live.Components} components, " +
+                        $"but '{scenePath}' on disk holds {disk.GameObjectCount} / {disk.ComponentCount}. Saving would " +
+                        $"overwrite that disk content with the smaller in-memory state (the 8K-line-loss class).",
+                        "save_scene",
+                        "If the in-memory state is stale, run editor.reload_scene until integrity.verified=true before " +
+                        "saving. If you intentionally deleted this many objects/components, pass force:true.",
+                        new
+                        {
+                            diskGameObjects = disk.GameObjectCount,
+                            memoryGameObjects = live.GameObjects,
+                            diskComponents = disk.ComponentCount,
+                            memoryComponents = live.Components,
+                            blockedByGameObjectDeficit = goDeficit > goThreshold,
+                            blockedByComponentDeficit = compDeficit > compThreshold,
+                            gameObjectDeficitThreshold = goThreshold,
+                            componentDeficitThreshold = compThreshold
+                        },
+                        McpErrorCode.SaveRefusedCountDeficit );
+                }
+            }
+        }
+
         session.Save( false );
-        return HandlerBase.Confirm( $"Saved '{session.Scene?.Name}'." );
+        SceneIntegrityGuard.ClearHold( scenePath );
+        return HandlerBase.Success( new
+        {
+            message = $"Saved '{session.Scene?.Name}'.",
+            forced = force,
+            memoryGameObjects = live.GameObjects,
+            memoryComponents = live.Components,
+            diskGameObjectsBeforeSave = disk is { Parsed: true } ? disk.GameObjectCount : (int?)null
+        } );
     }
 
     // ── save_scene_as ────────────────────────────────────────────────────
@@ -699,6 +868,8 @@ internal static class EditorHandler
                 if ( target == null )
                 {
                     var normalized = SceneHelpers.NormalizePath( explicitPath );
+                    var preDiskOpened = SceneIntegrityGuard.SnapshotDisk(
+                        SceneIntegrityGuard.ResolveAbsolutePath( normalized ) );
                     target = SceneEditorSession.CreateFromPath( normalized );
                     if ( target == null && !normalized.EndsWith( ".scene" ) && !normalized.EndsWith( ".prefab" ) )
                         target = SceneEditorSession.CreateFromPath( normalized + ".scene" );
@@ -709,7 +880,7 @@ internal static class EditorHandler
 
                     target.MakeActive();
                     resolvedPath = TryGetScenePath( target ) ?? explicitPath;
-                    return BuildReloadResult( target, resolvedPath, "opened" );
+                    return BuildReloadResult( target, resolvedPath, "opened", preDiskOpened );
                 }
             }
             else
@@ -720,8 +891,17 @@ internal static class EditorHandler
                 resolvedPath = TryGetScenePath( target );
             }
 
-            // Reload the matched session in place. SceneEditorSession.Reload()
-            // discards in-memory state and re-reads from disk.
+            // Snapshot the disk file BEFORE the reload so BuildReloadResult can
+            // (a) detect the reload itself mutating the file and (b) compare the
+            // loaded in-memory state against the disk truth.
+            var preDisk = SceneIntegrityGuard.SnapshotDisk(
+                SceneIntegrityGuard.ResolveAbsolutePath( resolvedPath ) );
+
+            // Reload the matched session in place. CAUTION: SceneEditorSession.Reload()
+            // is Scene.Load( Scene.Source ) — the CACHED SceneFile resource, NOT a fresh
+            // disk read (engine: Sandbox.Tools/Scene/Session/SceneEditorSession.cs:299).
+            // If the asset watcher hasn't reimported a fresh disk edit (play mode), this
+            // loads stale state — BuildReloadResult detects that and reports partial_load.
             try
             {
                 target.MakeActive();
@@ -739,12 +919,12 @@ internal static class EditorHandler
                             $"Reload() failed ({ex.Message}) and CreateFromPath fallback failed for '{resolvedPath}'.",
                             "reload_scene" );
                     fresh.MakeActive();
-                    return BuildReloadResult( fresh, resolvedPath, "reopened" );
+                    return BuildReloadResult( fresh, resolvedPath, "reopened", preDisk );
                 }
                 return HandlerBase.Error( $"Reload failed: {ex.Message}", "reload_scene" );
             }
 
-            return BuildReloadResult( target, resolvedPath, "reloaded" );
+            return BuildReloadResult( target, resolvedPath, "reloaded", preDisk );
         }
         catch ( Exception ex )
         {
@@ -752,29 +932,237 @@ internal static class EditorHandler
         }
     }
 
-    private static object BuildReloadResult( SceneEditorSession session, string path, string mode )
+    // Truth verdict added 2026-06-11 (findings #5). The legacy version reported
+    // mode:"reloaded" + a sane-looking totalObjects regardless of whether the load
+    // actually matched disk — which is exactly how two agents lost ~8K lines each
+    // (memories feedback_reload_scene_overwrites_disk_with_stale_memory,
+    // feedback_save_scene_after_failed_reload_loses_thousands_of_lines).
+    private static object BuildReloadResult( SceneEditorSession session, string path, string loadAction,
+        SceneIntegrityGuard.DiskSnapshot preDisk )
     {
         var scene = session?.Scene;
-        int totalObjects = 0;
         int rootObjects = 0;
         if ( scene != null )
         {
-            try
-            {
-                rootObjects = scene.Children.Count;
-                totalObjects = SceneHelpers.WalkAll( scene, includeDisabled: true ).Count();
-            }
-            catch { }
+            try { rootObjects = scene.Children.Count; } catch { }
         }
+
+        // Full uncapped walk — the legacy WalkAll skips ignore-marked objects and
+        // large subtrees, which would corrupt the disk comparison.
+        var live = SceneIntegrityGuard.CountLive( scene );
+
+        // Re-snapshot disk AFTER the load: (a) compare memory against what is on
+        // disk right now, (b) detect the reload itself having written to the file
+        // (the stale-merge clobber class).
+        var absPath = preDisk?.AbsolutePath ?? SceneIntegrityGuard.ResolveAbsolutePath( path );
+        var postDisk = SceneIntegrityGuard.SnapshotDisk( absPath );
+
+        bool diskWriteDetected = preDisk is { Exists: true } && postDisk.Exists &&
+                                 preDisk.ContentHash != null && postDisk.ContentHash != null &&
+                                 !string.Equals( preDisk.ContentHash, postDisk.ContentHash, StringComparison.OrdinalIgnoreCase );
+
+        string mode = loadAction;
+        string warning = null;
+        bool holdPlaced = false;
+        bool verified = false;
+
+        if ( diskWriteDetected )
+        {
+            mode = "disk_overwritten";
+            warning = $"reload_scene MUTATED '{path}' on disk during the load " +
+                      $"({preDisk.FileLength} -> {postDisk.FileLength} bytes). If you edited this file on disk before " +
+                      $"reloading, your edit may have just been overwritten by stale in-memory state. Run " +
+                      $"`git diff -- <scene file>` NOW and recover via `git checkout` if needed. save_scene will " +
+                      $"refuse this scene until a clean verified reload (or force:true).";
+            SceneIntegrityGuard.PlaceHold( path, "disk_overwritten", postDisk.GameObjectCount, live.GameObjects, warning );
+            holdPlaced = true;
+        }
+        else if ( postDisk.Parsed &&
+                  ( live.GameObjects < postDisk.GameObjectCount || live.Components < postDisk.ComponentCount ) )
+        {
+            mode = "partial_load";
+            warning = $"PARTIAL LOAD: in-memory scene holds {live.GameObjects}/{postDisk.GameObjectCount} GameObjects " +
+                      $"and {live.Components}/{postDisk.ComponentCount} components present on disk. The engine loaded a " +
+                      $"stale cached SceneFile (disk edit not yet reimported — typical in/just after play mode). " +
+                      $"Do NOT save_scene (it will refuse). Stop play mode, give the asset watcher a moment to " +
+                      $"reimport, then reload_scene again until integrity.verified=true.";
+            SceneIntegrityGuard.PlaceHold( path, "partial_load", postDisk.GameObjectCount, live.GameObjects, warning );
+            holdPlaced = true;
+        }
+        else if ( postDisk.Parsed )
+        {
+            verified = true;
+            SceneIntegrityGuard.ClearHold( path );
+        }
+        // Disk missing/unparseable: leave any existing hold in place — health unproven.
+
         return HandlerBase.Success( new
         {
-            message = $"Scene {mode}: '{scene?.Name ?? "(unnamed)"}'.",
+            message = warning ?? $"Scene {loadAction}: '{scene?.Name ?? "(unnamed)"}' — verified against disk " +
+                      $"({live.GameObjects} GameObjects, {live.Components} components).",
             mode,
+            loadAction,
             sceneName = scene?.Name,
             scenePath = path,
-            totalObjects,
-            rootObjects
+            totalObjects = live.GameObjects,
+            rootObjects,
+            integrity = new
+            {
+                verified,
+                holdPlaced,
+                diskWriteDetectedDuringReload = diskWriteDetected,
+                diskGameObjects   = postDisk.Exists && postDisk.Parsed ? postDisk.GameObjectCount : (int?)null,
+                memoryGameObjects = live.GameObjects,
+                diskComponents    = postDisk.Exists && postDisk.Parsed ? postDisk.ComponentCount : (int?)null,
+                memoryComponents  = live.Components,
+                diskParseError    = postDisk.Exists && !postDisk.Parsed ? postDisk.ParseError : null,
+                diskFile          = absPath
+            }
         } );
+    }
+
+    // ── save_all ──────────────────────────────────────────────────────
+    //
+    // Ported from upstream Arenula 2a4ca97 (2026-08-05), but NOT verbatim.
+    // Upstream calls session.Save(false) on every dirty session directly. Here
+    // that would be a hole straight through SceneIntegrityGuard: save_scene
+    // refuses to write when a reload left a partial scene in memory, or when the
+    // in-memory object count is far below what the file on disk holds (the
+    // 8K-line-loss class). A save_all that skipped those checks would overwrite
+    // exactly the scenes save_scene protects, and in bulk.
+    //
+    // So each session runs the same two gates. A session that fails is SKIPPED
+    // and reported in refused[] — never silently, and never force-written. Pass
+    // force:true to bypass, matching save_scene's escape hatch.
+
+    private static object SaveAll( JsonElement args )
+    {
+        var force = HandlerBase.GetBool( args, "force", false );
+
+        var dirty = SceneEditorSession.All?
+            .Where( s => s != null && s.HasUnsavedChanges )
+            .ToList() ?? new List<SceneEditorSession>();
+
+        if ( dirty.Count == 0 )
+            return HandlerBase.Success( new
+            {
+                message = "No sessions with unsaved changes.",
+                saved_count = 0,
+                refused_count = 0,
+                failure_count = 0,
+                saved = Array.Empty<object>(),
+                refused = Array.Empty<object>(),
+                failures = Array.Empty<object>()
+            } );
+
+        var saved = new List<object>();
+        var refused = new List<object>();
+        var failures = new List<object>();
+
+        foreach ( var session in dirty )
+        {
+            var sceneName = session.Scene?.Name ?? "(unnamed)";
+            var isPrefab = session.IsPrefabSession;
+            var scenePath = TryGetScenePath( session );
+
+            try
+            {
+                if ( !force )
+                {
+                    var refusal = IntegrityRefusalFor( session, scenePath );
+                    if ( refusal != null )
+                    {
+                        refused.Add( new { name = sceneName, isPrefabSession = isPrefab, file = scenePath, reason = refusal } );
+                        continue;
+                    }
+                }
+
+                session.Save( false );
+                SceneIntegrityGuard.ClearHold( scenePath );
+
+                // Post-condition, same shape as save_scene: the file exists, is
+                // non-empty, and the dirty flag cleared. Any of those missing
+                // means the engine dropped the save without throwing.
+                string absPath = null;
+                long fileSize = 0;
+                bool fileExists = false;
+
+                if ( !string.IsNullOrEmpty( scenePath ) )
+                {
+                    var asset = AssetSystem.FindByPath( scenePath );
+                    absPath = asset?.AbsolutePath;
+                    fileExists = !string.IsNullOrEmpty( absPath ) && File.Exists( absPath );
+                    fileSize = fileExists ? new FileInfo( absPath ).Length : 0;
+                }
+
+                bool stillDirty = session.HasUnsavedChanges;
+
+                if ( !fileExists || fileSize == 0 || stillDirty )
+                    failures.Add( new
+                    {
+                        name = sceneName,
+                        isPrefabSession = isPrefab,
+                        file = absPath,
+                        reason = stillDirty ? "still dirty after save"
+                            : !fileExists ? "file missing after save"
+                            : "file empty after save"
+                    } );
+                else
+                    saved.Add( new { name = sceneName, isPrefabSession = isPrefab, file = absPath, size_bytes = fileSize } );
+            }
+            catch ( Exception ex )
+            {
+                failures.Add( new { name = sceneName, isPrefabSession = isPrefab, error = ex.Message } );
+            }
+        }
+
+        var parts = new List<string> { $"Saved {saved.Count}/{dirty.Count} session(s)." };
+        if ( refused.Count > 0 )
+            parts.Add( $"{refused.Count} refused by the scene-integrity guard — see refused[]; pass force:true only if the in-memory state is what you want on disk." );
+        if ( failures.Count > 0 )
+            parts.Add( $"{failures.Count} failed — see failures[] and call get_log for engine errors." );
+
+        return HandlerBase.Success( new
+        {
+            message = string.Join( " ", parts ),
+            saved_count = saved.Count,
+            refused_count = refused.Count,
+            failure_count = failures.Count,
+            forced = force,
+            saved,
+            refused,
+            failures
+        } );
+    }
+
+    /// <summary>
+    /// Run save_scene's two integrity gates against one session. Returns a
+    /// human-readable refusal reason, or null when the session is safe to write.
+    /// </summary>
+    private static string IntegrityRefusalFor( SceneEditorSession session, string scenePath )
+    {
+        if ( SceneIntegrityGuard.TryGetHold( scenePath, out var hold ) )
+            return $"a reload of '{scenePath}' at {hold.PlacedUtc:HH:mm:ss}Z returned '{hold.Reason}' " +
+                   $"({hold.MemoryGameObjects}/{hold.DiskGameObjects} GameObjects loaded); writing now would " +
+                   "serialize that incomplete in-memory state over the disk file";
+
+        if ( string.IsNullOrEmpty( scenePath ) ) return null;
+
+        var disk = SceneIntegrityGuard.SnapshotDisk( SceneIntegrityGuard.ResolveAbsolutePath( scenePath ) );
+        if ( disk is not { Parsed: true } ) return null;
+
+        var live = SceneIntegrityGuard.CountLive( session.Scene );
+        int goDeficit = disk.GameObjectCount - live.GameObjects;
+        int goThreshold = SceneIntegrityGuard.SaveDeficitThreshold( disk.GameObjectCount );
+        int compDeficit = disk.ComponentCount - live.Components;
+        int compThreshold = Math.Max( 5, disk.ComponentCount / 10 );
+
+        if ( goDeficit > goThreshold || compDeficit > compThreshold )
+            return $"in-memory holds {live.GameObjects} GameObjects / {live.Components} components but the disk file " +
+                   $"holds {disk.GameObjectCount} / {disk.ComponentCount}; saving would overwrite that with the " +
+                   "smaller in-memory state";
+
+        return null;
     }
 
     private static string TryGetScenePath( SceneEditorSession session )

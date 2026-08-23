@@ -9,31 +9,72 @@ using Sandbox;
 namespace Arenula;
 
 /// <summary>
-/// reflection tool: search, get_type, get_members, list_assemblies.
-/// Reflects over loaded S&Box assemblies for ground-truth API discovery.
-/// Returns types, methods, properties, attributes from the running engine.
+/// reflection tool — search, get_type, get_members, list_assemblies. Reflects
+/// over loaded S&amp;Box assemblies for ground-truth API discovery; returns types,
+/// methods, properties, attributes from the running engine. Migrated to the
+/// [McpTool] attribute scan in mcp-dynamic-discovery Phase 3 Wave 3.2 — read-only
+/// multi-action tool, MainThread dispatch.
 /// </summary>
+[McpTool( "reflection",
+    "Reflect over loaded S&Box engine assemblies for ground-truth API discovery. Use 'search' to find types by name with optional namespace and kind filters. Use 'get_type' to get full details of a specific type (constructors, methods, properties, fields, attributes, interfaces). Use 'get_members' to search for methods or properties across all types by member name. Use 'list_assemblies' to see all loaded assemblies. This tool reads live engine state — it always reflects the current engine version, unlike cached documentation. Read-only, does not modify anything.",
+    ReadOnlyHint = true )]
 internal static class ReflectionHandler
 {
-    internal static object Handle( string action, JsonElement args )
+    // [McpAction] thin wrappers. Each preserves the legacy HandlerBase.Error
+    // response shape — the pre-migration Handle() switch wrapped every arm in
+    // the same try/catch.
+
+    [McpAction( "search", ReadOnly = true )]
+    internal static object HandleSearch( JsonElement args )
     {
-        try
-        {
-            return action switch
-            {
-                "search"          => Search( args ),
-                "get_type"        => GetType( args ),
-                "get_members"     => GetMembers( args ),
-                "list_assemblies" => ListAssemblies( args ),
-                _ => HandlerBase.Error( $"Unknown action '{action}'", action,
-                    "Valid actions: search, get_type, get_members, list_assemblies" )
-            };
-        }
-        catch ( Exception ex )
-        {
-            return HandlerBase.Error( ex.Message, action );
-        }
+        try { return Search( args ); }
+        catch ( Exception ex ) { return HandlerBase.Error( ex.Message, "search" ); }
     }
+
+    [McpAction( "get_type", ReadOnly = true )]
+    internal static object HandleGetType( JsonElement args )
+    {
+        try { return GetType( args ); }
+        catch ( Exception ex ) { return HandlerBase.Error( ex.Message, "get_type" ); }
+    }
+
+    [McpAction( "get_members", ReadOnly = true )]
+    internal static object HandleGetMembers( JsonElement args )
+    {
+        try { return GetMembers( args ); }
+        catch ( Exception ex ) { return HandlerBase.Error( ex.Message, "get_members" ); }
+    }
+
+    [McpAction( "list_assemblies", ReadOnly = true )]
+    internal static object HandleListAssemblies( JsonElement args )
+    {
+        try { return ListAssemblies( args ); }
+        catch ( Exception ex ) { return HandlerBase.Error( ex.Message, "list_assemblies" ); }
+    }
+
+    /// <summary>
+    /// tools/list inputSchema fragment — verbatim copy of the legacy
+    /// <c>ToolRegistry.Reflection.inputSchema</c> literal.
+    /// </summary>
+    internal static object InputSchema() => new
+    {
+        type = "object",
+        properties = new Dictionary<string, object>
+        {
+            ["action"] = new { type = "string", description = "The operation to perform.", @enum = new[] { "search", "get_type", "get_members", "list_assemblies" } },
+            ["query"] = new { type = "string", description = "Search term. Required for: search, get_members." },
+            ["name"] = new { type = "string", description = "Full or short type name. Required for: get_type." },
+            ["namespace"] = new { type = "string", description = "Namespace filter. Used by: search." },
+            ["kind"] = new { type = "string", description = "Type kind filter. Used by: search, get_members (member kind: method, property).", @enum = new[] { "class", "struct", "enum", "interface", "method", "property" } },
+            ["section"] = new { type = "string", description = "Limit get_type output to a specific section. Used by: get_type.", @enum = new[] { "interfaces", "attributes", "constructors", "properties", "methods", "fields", "values" } },
+            ["include_inherited"] = new { type = "boolean", description = "Include inherited members. Used by: get_type. Default: false." },
+            ["filter"] = new { type = "string", description = "Name filter. Used by: list_assemblies." },
+            ["offset"] = new { type = "integer", description = "Pagination offset. Used by: search, get_members. Default: 0." },
+            ["limit"] = new { type = "integer", description = "Max results. Used by: search, get_members. Default: 25." }
+        },
+        required = new[] { "action" },
+        additionalProperties = false
+    };
 
     // ── search ──────────────────────────────────────────────────────
     // Search loaded types by name. Returns matching types with namespace,

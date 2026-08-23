@@ -1,5 +1,33 @@
+// Editor/Handlers/SnapshotHandler.cs
+//
+// [HANDOFF-TRUST: engine-fork-elite-leverage Phase 3.2 — atomic scene-checkpoint
+// primitive (library-first). No live hypothesis from any inherited handoff
+// applies: this is a greenfield extension of a well-understood library handler
+// (packet.md §"Prior Failed Approaches" — none). Per-agent storage mirrors the
+// Phase 3.3 ScratchHandler pattern.]
+//
+// engine-fork-elite-leverage Phase 3.2 — per-agent named scene snapshots.
+//
+// Three changes over the original flat process-global handler:
+//   1. Per-agent two-level storage (agentId → name → snapshot). Concurrent
+//      agents never collide on a name and never evict each other's checkpoints.
+//   2. Cap raised 10 → 50, evaluated and evicted PER AGENT — a busy agent can
+//      no longer starve the rest (the multi-agent bug this phase fixes).
+//   3. Material + value-type long-tail capture/restore. The original Restore
+//      round-tripped only string/bool/int/float; Color / Vector2-4 / Rotation /
+//      Angles / Enum / Material were captured, surfaced in diff, then silently
+//      dropped on restore. A MaterialOverride swap is now revertable.
+//
+// RenderAttributes is NOT snapshotted: it has no key-enumeration API (52 keyed
+// Set/Get methods, 0 properties/fields) and its values are transient render
+// state "not saved to disk" by design. The Material resource reference carries
+// the baked shader parameters via its .vmat — that is the library-achievable
+// 80%. A full RenderAttributes bag snapshot is engine-fork Scene.Checkpoint()
+// territory (charter §3.2, DEFERRED). See plan.md §"Attributes — scope decision".
+
 using System;
 using System.Collections.Generic;
+using System.Globalization;
 using System.Linq;
 using System.Text.Json;
 using Sandbox;
@@ -8,25 +36,39 @@ namespace Arenula;
 
 /// <summary>
 /// snapshot tool: take, list, diff, restore, delete scene state snapshots.
-/// Enables safe experimentation by comparing before/after states
-/// and reverting property changes on existing objects.
+/// Snapshots are stored per-agent — each calling agent has its own isolated
+/// bucket (up to <see cref="MaxSnapshotsPerAgent"/> named snapshots), so
+/// concurrent agents never overwrite or evict one another. Enables safe
+/// experimentation by comparing before/after states and reverting property
+/// changes on existing objects.
 /// </summary>
 internal static class SnapshotHandler
 {
-    private static readonly Dictionary<string, SceneSnapshot> _snapshots = new();
-    private const int MaxSnapshots = 10;
+    // agentId → (snapshotName → snapshot). Two-level (not composite-key) so
+    // per-agent eviction and per-agent `list` are O(bucket).
+    private static readonly Dictionary<string, Dictionary<string, SceneSnapshot>> _snapshotsByAgent = new();
 
-    internal static object Handle( string action, JsonElement args )
+    private const int MaxSnapshotsPerAgent = 50;
+
+    // Fallback bucket for un-identified / legacy clients (no session.identify).
+    // They stay fully functional, degraded only in that they share one bucket.
+    private const string AnonymousBucket = "_anonymous";
+
+    // Monotonic insertion counter — eviction orders by this, not by TakenAt,
+    // so 50+ snapshots taken inside one DateTime tick still evict deterministically.
+    private static long _seqCounter;
+
+    internal static object Handle( string action, JsonElement args, McpSession session )
     {
         try
         {
             return action switch
             {
-                "take"    => Take( args ),
-                "list"    => List(),
-                "diff"    => Diff( args ),
-                "restore" => Restore( args ),
-                "delete"  => Delete( args ),
+                "take"    => Take( args, session ),
+                "list"    => List( args, session ),
+                "diff"    => Diff( args, session ),
+                "restore" => Restore( args, session ),
+                "delete"  => Delete( args, session ),
                 _ => HandlerBase.Error( $"Unknown action '{action}' for tool 'snapshot'.", action,
                     "Valid actions: take, list, diff, restore, delete" )
             };
@@ -42,6 +84,8 @@ internal static class SnapshotHandler
     private sealed class SceneSnapshot
     {
         public string Name;
+        public string AgentId;
+        public long Seq;
         public DateTime TakenAt;
         public Dictionary<string, ObjectState> Objects; // keyed by GUID
     }
@@ -67,9 +111,34 @@ internal static class SnapshotHandler
         public Dictionary<string, string> Properties; // serialized as strings
     }
 
+    // ── Per-agent storage helpers ────────────────────────────────────
+
+    /// <summary>
+    /// Resolve the agent bucket id for a call: explicit <c>agent_id</c> arg wins
+    /// (lets a supervisor target another agent's bucket), else the live session's
+    /// identified <see cref="McpSession.AgentId"/>, else <see cref="AnonymousBucket"/>.
+    /// </summary>
+    private static string ResolveAgentId( JsonElement args, McpSession session )
+    {
+        var explicitId = HandlerBase.GetString( args, "agent_id" );
+        if ( !string.IsNullOrWhiteSpace( explicitId ) ) return explicitId;
+        if ( session != null && !string.IsNullOrWhiteSpace( session.AgentId ) ) return session.AgentId;
+        return AnonymousBucket;
+    }
+
+    private static Dictionary<string, SceneSnapshot> GetOrCreateBucket( string agentId )
+    {
+        if ( !_snapshotsByAgent.TryGetValue( agentId, out var bucket ) )
+        {
+            bucket = new Dictionary<string, SceneSnapshot>();
+            _snapshotsByAgent[agentId] = bucket;
+        }
+        return bucket;
+    }
+
     // ── take ─────────────────────────────────────────────────────────
 
-    private static object Take( JsonElement args )
+    private static object Take( JsonElement args, McpSession session )
     {
         var scene = SceneHelpers.ResolveScene();
         if ( scene == null )
@@ -79,11 +148,15 @@ internal static class SnapshotHandler
         if ( string.IsNullOrEmpty( name ) )
             return HandlerBase.Error( "Missing required 'name' parameter.", "take" );
 
-        if ( _snapshots.Count >= MaxSnapshots && !_snapshots.ContainsKey( name ) )
+        var agentId = ResolveAgentId( args, session );
+        var bucket = GetOrCreateBucket( agentId );
+
+        // Per-agent eviction: only this agent's oldest is removed when its own
+        // bucket is full and the name is new. Never touches another agent's bucket.
+        if ( bucket.Count >= MaxSnapshotsPerAgent && !bucket.ContainsKey( name ) )
         {
-            // Remove oldest snapshot
-            var oldest = _snapshots.OrderBy( kvp => kvp.Value.TakenAt ).First();
-            _snapshots.Remove( oldest.Key );
+            var oldest = bucket.OrderBy( kvp => kvp.Value.Seq ).First();
+            bucket.Remove( oldest.Key );
         }
 
         var scopeId = HandlerBase.GetString( args, "scope_id" );
@@ -92,6 +165,8 @@ internal static class SnapshotHandler
         var snapshot = new SceneSnapshot
         {
             Name = name,
+            AgentId = agentId,
+            Seq = ++_seqCounter,
             TakenAt = DateTime.UtcNow,
             Objects = new Dictionary<string, ObjectState>()
         };
@@ -113,15 +188,17 @@ internal static class SnapshotHandler
             snapshot.Objects[state.Id] = state;
         }
 
-        _snapshots[name] = snapshot;
+        bucket[name] = snapshot;
 
         return HandlerBase.Success( new
         {
             name,
+            agentId,
             objectCount = snapshot.Objects.Count,
             takenAt = snapshot.TakenAt.ToString( "yyyy-MM-dd HH:mm:ss" ),
-            totalSnapshots = _snapshots.Count,
-            message = $"Snapshot '{name}' taken with {snapshot.Objects.Count} objects."
+            totalSnapshots = bucket.Count,
+            maxSnapshotsPerAgent = MaxSnapshotsPerAgent,
+            message = $"Snapshot '{name}' taken with {snapshot.Objects.Count} objects for agent '{agentId}'."
         } );
     }
 
@@ -159,7 +236,7 @@ internal static class SnapshotHandler
                 try
                 {
                     var val = prop.GetValue( comp );
-                    compState.Properties[prop.Name] = val?.ToString() ?? "null";
+                    compState.Properties[prop.Name] = SerializePropertyValue( val );
                 }
                 catch { }
             }
@@ -168,6 +245,23 @@ internal static class SnapshotHandler
         }
 
         return state;
+    }
+
+    /// <summary>
+    /// Serialize one component-property value to its restorable string form.
+    /// A <see cref="Material"/> is stored by its disk path (<see cref="Material.Name"/>)
+    /// so <see cref="Material.Load"/> can re-resolve it; a runtime/anonymous
+    /// material (no disk path) stores the non-restorable sentinel
+    /// <c>&lt;runtime-material&gt;</c>. Everything else round-trips via
+    /// <c>ToString()</c> — Color / Vector2-4 / Rotation / Angles / enum all have
+    /// a matching <c>Parse</c> (see <see cref="TryDeserialize"/>).
+    /// </summary>
+    private static string SerializePropertyValue( object val )
+    {
+        if ( val == null ) return "null";
+        if ( val is Material m )
+            return m.IsValid && !string.IsNullOrEmpty( m.Name ) ? m.Name : "<runtime-material>";
+        return val.ToString() ?? "null";
     }
 
     private static IEnumerable<GameObject> WalkSubtree( GameObject root, bool includeDisabled )
@@ -183,13 +277,25 @@ internal static class SnapshotHandler
 
     // ── list ─────────────────────────────────────────────────────────
 
-    private static object List()
+    private static object List( JsonElement args, McpSession session )
     {
-        var snapshots = _snapshots.Values
-            .OrderByDescending( s => s.TakenAt )
+        var allAgents = HandlerBase.GetBool( args, "all_agents", false );
+        var agentId = ResolveAgentId( args, session );
+
+        IEnumerable<SceneSnapshot> source;
+        if ( allAgents )
+            source = _snapshotsByAgent.Values.SelectMany( b => b.Values );
+        else
+            source = _snapshotsByAgent.TryGetValue( agentId, out var bucket )
+                ? bucket.Values
+                : Enumerable.Empty<SceneSnapshot>();
+
+        var snapshots = source
+            .OrderByDescending( s => s.Seq )
             .Select( s => new
             {
                 name = s.Name,
+                agentId = s.AgentId,
                 objectCount = s.Objects.Count,
                 takenAt = s.TakenAt.ToString( "yyyy-MM-dd HH:mm:ss" )
             } )
@@ -198,14 +304,16 @@ internal static class SnapshotHandler
         return HandlerBase.Success( new
         {
             count = snapshots.Count,
-            maxSnapshots = MaxSnapshots,
+            agentId = allAgents ? "all" : agentId,
+            allAgents,
+            maxSnapshotsPerAgent = MaxSnapshotsPerAgent,
             snapshots
         } );
     }
 
     // ── diff ─────────────────────────────────────────────────────────
 
-    private static object Diff( JsonElement args )
+    private static object Diff( JsonElement args, McpSession session )
     {
         var scene = SceneHelpers.ResolveScene();
         if ( scene == null )
@@ -217,8 +325,11 @@ internal static class SnapshotHandler
         if ( string.IsNullOrEmpty( nameA ) )
             return HandlerBase.Error( "Missing required 'name' or 'name_a' parameter.", "diff" );
 
-        if ( !_snapshots.TryGetValue( nameA, out var snapshotA ) )
-            return HandlerBase.Error( $"Snapshot '{nameA}' not found.", "diff" );
+        var agentId = ResolveAgentId( args, session );
+        var bucket = GetOrCreateBucket( agentId );
+
+        if ( !bucket.TryGetValue( nameA, out var snapshotA ) )
+            return HandlerBase.Error( $"Snapshot '{nameA}' not found for agent '{agentId}'.", "diff" );
 
         // If name_b provided, compare two snapshots. Otherwise, compare snapshot vs current scene.
         Dictionary<string, ObjectState> stateB;
@@ -226,8 +337,8 @@ internal static class SnapshotHandler
 
         if ( !string.IsNullOrEmpty( nameB ) )
         {
-            if ( !_snapshots.TryGetValue( nameB, out var snapshotB ) )
-                return HandlerBase.Error( $"Snapshot '{nameB}' not found.", "diff" );
+            if ( !bucket.TryGetValue( nameB, out var snapshotB ) )
+                return HandlerBase.Error( $"Snapshot '{nameB}' not found for agent '{agentId}'.", "diff" );
             stateB = snapshotB.Objects;
             labelB = nameB;
         }
@@ -335,6 +446,7 @@ internal static class SnapshotHandler
         return HandlerBase.Success( new
         {
             compare = $"{nameA} vs {labelB}",
+            agentId,
             addedCount = added.Count,
             removedCount = removed.Count,
             modifiedCount = modified.Count,
@@ -346,7 +458,7 @@ internal static class SnapshotHandler
 
     // ── restore ──────────────────────────────────────────────────────
 
-    private static object Restore( JsonElement args )
+    private static object Restore( JsonElement args, McpSession session )
     {
         var scene = SceneHelpers.ResolveScene();
         if ( scene == null )
@@ -356,11 +468,16 @@ internal static class SnapshotHandler
         if ( string.IsNullOrEmpty( name ) )
             return HandlerBase.Error( "Missing required 'name' parameter.", "restore" );
 
-        if ( !_snapshots.TryGetValue( name, out var snapshot ) )
-            return HandlerBase.Error( $"Snapshot '{name}' not found.", "restore" );
+        var agentId = ResolveAgentId( args, session );
+        var bucket = GetOrCreateBucket( agentId );
+
+        if ( !bucket.TryGetValue( name, out var snapshot ) )
+            return HandlerBase.Error( $"Snapshot '{name}' not found for agent '{agentId}'.", "restore" );
 
         int restored = 0;
         int skipped = 0;
+        int propsRestored = 0;
+        int propsSkipped = 0;
         var warnings = new List<string>();
 
         foreach ( var kvp in snapshot.Objects )
@@ -417,26 +534,30 @@ internal static class SnapshotHandler
                 {
                     var prop = comp.GetType().GetProperty( propKvp.Key,
                         System.Reflection.BindingFlags.Public | System.Reflection.BindingFlags.Instance );
-                    if ( prop == null || !prop.CanWrite ) continue;
+                    if ( prop == null || !prop.CanWrite || !prop.CanRead ) continue;
 
                     try
                     {
-                        // Read current value to compare
-                        var currentVal = prop.GetValue( comp )?.ToString() ?? "null";
-                        if ( currentVal == propKvp.Value ) continue; // unchanged, skip
+                        // Compare current value against the snapshot in the SAME
+                        // serialized form (SerializePropertyValue) so Material —
+                        // captured by .Name, not .ToString() — compares correctly.
+                        var currentSerialized = SerializePropertyValue( prop.GetValue( comp ) );
+                        if ( currentSerialized == propKvp.Value ) continue; // unchanged
 
-                        // Attempt to restore — this is best-effort since we stored as strings
-                        var targetType = prop.PropertyType;
-                        if ( targetType == typeof( string ) )
-                            prop.SetValue( comp, propKvp.Value == "null" ? null : propKvp.Value );
-                        else if ( targetType == typeof( bool ) )
-                            prop.SetValue( comp, bool.Parse( propKvp.Value ) );
-                        else if ( targetType == typeof( int ) )
-                            prop.SetValue( comp, int.Parse( propKvp.Value ) );
-                        else if ( targetType == typeof( float ) )
-                            prop.SetValue( comp, float.Parse( propKvp.Value, System.Globalization.CultureInfo.InvariantCulture ) );
+                        if ( TryDeserialize( propKvp.Value, prop.PropertyType, out var restoredValue ) )
+                        {
+                            prop.SetValue( comp, restoredValue );
+                            propsRestored++;
+                        }
+                        else
+                        {
+                            propsSkipped++;
+                        }
                     }
-                    catch { }
+                    catch
+                    {
+                        propsSkipped++;
+                    }
                 }
             }
 
@@ -455,25 +576,81 @@ internal static class SnapshotHandler
         return HandlerBase.Success( new
         {
             snapshot = name,
+            agentId,
             restored,
             skipped,
+            componentPropsRestored = propsRestored,
+            componentPropsSkipped = propsSkipped,
             warningCount = warnings.Count,
             warnings,
             message = $"Restored {restored} objects from snapshot '{name}'. {skipped} objects could not be found."
         } );
     }
 
+    /// <summary>
+    /// Deserialize one captured property string back to <paramref name="t"/>.
+    /// Covers the value-type long tail the original handler dropped on restore:
+    /// string / bool / int / long / float / double / Color / Vector2-4 /
+    /// Rotation / Angles / enum / Material. Non-restorable sentinels
+    /// (<c>null</c>, <c>&lt;runtime-material&gt;</c>) and any unrecognised type
+    /// return <c>false</c> so the caller skips cleanly. Each parse stays guarded.
+    /// </summary>
+    private static bool TryDeserialize( string s, Type t, out object result )
+    {
+        result = null;
+        if ( s == null ) return false;
+        // Sentinels: captured but intentionally not restorable.
+        if ( s == "null" || s == "<runtime-material>" || s == "<null>" ) return false;
+
+        try
+        {
+            if ( t == typeof( string ) ) { result = s; return true; }
+            if ( t == typeof( bool ) ) { result = bool.Parse( s ); return true; }
+            if ( t == typeof( int ) ) { result = int.Parse( s, CultureInfo.InvariantCulture ); return true; }
+            if ( t == typeof( long ) ) { result = long.Parse( s, CultureInfo.InvariantCulture ); return true; }
+            if ( t == typeof( float ) ) { result = float.Parse( s, CultureInfo.InvariantCulture ); return true; }
+            if ( t == typeof( double ) ) { result = double.Parse( s, CultureInfo.InvariantCulture ); return true; }
+            if ( t == typeof( Color ) )
+            {
+                var c = Color.Parse( s );
+                if ( c.HasValue ) { result = c.Value; return true; }
+                return false;
+            }
+            if ( t == typeof( Vector2 ) ) { result = Vector2.Parse( s ); return true; }
+            if ( t == typeof( Vector3 ) ) { result = Vector3.Parse( s ); return true; }
+            if ( t == typeof( Vector4 ) ) { result = Vector4.Parse( s ); return true; }
+            if ( t == typeof( Rotation ) ) { result = Rotation.Parse( s ); return true; }
+            if ( t == typeof( Angles ) ) { result = Angles.Parse( s ); return true; }
+            if ( t == typeof( Material ) )
+            {
+                var m = Material.Load( s );
+                if ( m != null ) { result = m; return true; }
+                return false;
+            }
+            if ( t.IsEnum ) { result = Enum.Parse( t, s ); return true; }
+        }
+        catch
+        {
+            return false;
+        }
+        return false;
+    }
+
     // ── delete ───────────────────────────────────────────────────────
 
-    private static object Delete( JsonElement args )
+    private static object Delete( JsonElement args, McpSession session )
     {
         var name = HandlerBase.GetString( args, "name" );
         if ( string.IsNullOrEmpty( name ) )
             return HandlerBase.Error( "Missing required 'name' parameter.", "delete" );
 
-        if ( !_snapshots.Remove( name ) )
-            return HandlerBase.Error( $"Snapshot '{name}' not found.", "delete" );
+        var agentId = ResolveAgentId( args, session );
+        var bucket = GetOrCreateBucket( agentId );
 
-        return HandlerBase.Confirm( $"Snapshot '{name}' deleted. {_snapshots.Count} snapshots remaining." );
+        if ( !bucket.Remove( name ) )
+            return HandlerBase.Error( $"Snapshot '{name}' not found for agent '{agentId}'.", "delete" );
+
+        return HandlerBase.Confirm(
+            $"Snapshot '{name}' deleted for agent '{agentId}'. {bucket.Count} snapshots remaining." );
     }
 }

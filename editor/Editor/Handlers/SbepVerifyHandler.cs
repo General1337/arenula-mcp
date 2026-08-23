@@ -17,6 +17,8 @@ namespace Arenula;
 /// </summary>
 internal static class SbepVerifyHandler
 {
+    private readonly record struct VerificationIssue( string severity, string message );
+
     private static readonly Regex GuidHexPattern = new(
         @"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$",
         RegexOptions.IgnoreCase | RegexOptions.Compiled );
@@ -95,20 +97,20 @@ internal static class SbepVerifyHandler
         } );
     }
 
-    private static List<(string severity, string message)> ValidatePrefab( string path )
+    private static List<VerificationIssue> ValidatePrefab( string path )
     {
-        var issues = new List<(string, string)>();
+        var issues = new List<VerificationIssue>();
 
         string json;
         try { json = Sandbox.FileSystem.Mounted.ReadAllText( path ); }
-        catch { issues.Add( ("error", "Cannot read file") ); return issues; }
+        catch { issues.Add( new VerificationIssue( "error", "Cannot read file" ) ); return issues; }
 
         JsonNode root;
         try { root = JsonNode.Parse( json ); }
-        catch { issues.Add( ("error", "Invalid JSON") ); return issues; }
+        catch { issues.Add( new VerificationIssue( "error", "Invalid JSON" ) ); return issues; }
 
         var rootObj = root?["RootObject"];
-        if ( rootObj is null ) { issues.Add( ("error", "Missing RootObject") ); return issues; }
+        if ( rootObj is null ) { issues.Add( new VerificationIssue( "error", "Missing RootObject" ) ); return issues; }
 
         // GUID check
         CheckGuids( rootObj, issues );
@@ -116,11 +118,11 @@ internal static class SbepVerifyHandler
         // NetworkMode
         var netMode = rootObj["NetworkMode"]?.GetValue<int>() ?? 0;
         if ( netMode != 2 )
-            issues.Add( ("warning", $"NetworkMode={netMode}, expected 2") );
+            issues.Add( new VerificationIssue( "warning", $"NetworkMode={netMode}, expected 2" ) );
 
         // Components
         var components = rootObj["Components"]?.AsArray();
-        if ( components is null ) { issues.Add( ("error", "No components") ); return issues; }
+        if ( components is null ) { issues.Add( new VerificationIssue( "error", "No components" ) ); return issues; }
 
         bool hasRb = false, hasCollider = false, hasRenderer = false, hasDevBox = false;
         string modelPath = null;
@@ -137,36 +139,44 @@ internal static class SbepVerifyHandler
 
             var td = TypeLibrary.GetType( typeName );
             if ( td is null && typeName is not null )
-                issues.Add( ("warning", $"Type '{typeName}' not found in TypeLibrary") );
+                issues.Add( new VerificationIssue( "warning", $"Type '{typeName}' not found in TypeLibrary" ) );
 
             // Check if SBEP component
             if ( IsSbepType( typeName ) ) hasSbep = true;
         }
 
-        if ( hasRenderer && !string.IsNullOrEmpty( modelPath ) && modelPath.Contains( "dev/" ) )
-            issues.Add( ("error", $"Model '{modelPath}' is a dev model that doesn't exist") );
+        if ( hasRenderer && IsKnownMissingDevModel( modelPath ) )
+            issues.Add( new VerificationIssue( "error", $"Model '{modelPath}' is a known missing dev model path") );
 
         if ( hasRenderer && string.IsNullOrEmpty( modelPath ) && !hasDevBox )
-            issues.Add( ("warning", "Null model without DevBoxModel — may be invisible") );
+            issues.Add( new VerificationIssue( "warning", "Null model without DevBoxModel — may be invisible" ) );
 
         if ( hasSbep && !hasRb )
-            issues.Add( ("error", "Missing Rigidbody") );
+            issues.Add( new VerificationIssue( "error", "Missing Rigidbody" ) );
         if ( hasSbep && !hasCollider )
-            issues.Add( ("error", "Missing Collider") );
+            issues.Add( new VerificationIssue( "error", "Missing Collider" ) );
 
         // .sent check
         var sentPath = path.Replace( ".prefab", ".sent" );
         if ( !Sandbox.FileSystem.Mounted.FileExists( sentPath ) )
-            issues.Add( ("warning", "No .sent file — won't appear in spawn menu") );
+            issues.Add( new VerificationIssue( "warning", "No .sent file — won't appear in spawn menu" ) );
 
         return issues;
     }
 
-    private static void CheckGuids( JsonNode node, List<(string, string)> issues )
+    private static bool IsKnownMissingDevModel( string modelPath )
+    {
+        if ( string.IsNullOrEmpty( modelPath ) ) return false;
+
+        var normalized = modelPath.Replace( '\\', '/' );
+        return normalized.Equals( "models/dev/box.vmdl", StringComparison.OrdinalIgnoreCase );
+    }
+
+    private static void CheckGuids( JsonNode node, List<VerificationIssue> issues )
     {
         var guid = node["__guid"]?.GetValue<string>();
         if ( !string.IsNullOrEmpty( guid ) && !GuidHexPattern.IsMatch( guid ) )
-            issues.Add( ("error", $"Non-hex GUID: {guid}") );
+            issues.Add( new VerificationIssue( "error", $"Non-hex GUID: {guid}" ) );
 
         var components = node["Components"]?.AsArray();
         if ( components is not null )
@@ -174,7 +184,7 @@ internal static class SbepVerifyHandler
             {
                 var g = c?["__guid"]?.GetValue<string>();
                 if ( !string.IsNullOrEmpty( g ) && !GuidHexPattern.IsMatch( g ) )
-                    issues.Add( ("error", $"Non-hex component GUID: {g}") );
+                    issues.Add( new VerificationIssue( "error", $"Non-hex component GUID: {g}" ) );
             }
 
         var children = node["Children"]?.AsArray();
@@ -248,18 +258,18 @@ internal static class SbepVerifyHandler
         } );
     }
 
-    private static List<(string severity, string message)> ValidateComponentType( TypeDescription td )
+    private static List<VerificationIssue> ValidateComponentType( TypeDescription td )
     {
-        var issues = new List<(string, string)>();
+        var issues = new List<VerificationIssue>();
 
         // Check [Sync] properties
         foreach ( var member in td.Members )
         {
             if ( !member.HasAttribute<SyncAttribute>() ) continue;
             if ( !member.IsProperty )
-                issues.Add( ("error", $"[Sync] on field '{member.Name}' — must be property") );
+                issues.Add( new VerificationIssue( "error", $"[Sync] on field '{member.Name}' — must be property" ) );
             else if ( member is PropertyDescription prop && ( !prop.CanRead || !prop.CanWrite ) )
-                issues.Add( ("error", $"[Sync] on '{member.Name}' needs both getter and setter") );
+                issues.Add( new VerificationIssue( "error", $"[Sync] on '{member.Name}' needs both getter and setter" ) );
         }
 
         // Device-specific checks
@@ -273,12 +283,22 @@ internal static class SbepVerifyHandler
 
         if ( isDevice )
         {
-            var supportedProp = td.GetProperty( "SupportedTypes" );
-            if ( supportedProp is null )
-                issues.Add( ("error", "SupportedTypes property not found") );
+            if ( GetPropertyInHierarchy( td, "SupportedTypes" ) is null )
+                issues.Add( new VerificationIssue( "error", "SupportedTypes property not found" ) );
         }
 
         return issues;
+    }
+
+    private static PropertyDescription GetPropertyInHierarchy( TypeDescription td, string name )
+    {
+        for ( var check = td; check is not null; check = check.BaseType )
+        {
+            var prop = check.GetProperty( name );
+            if ( prop is not null ) return prop;
+        }
+
+        return null;
     }
 
     // ── smoke_test ───────────────────────────────────────────────────
@@ -298,10 +318,24 @@ internal static class SbepVerifyHandler
 
         Sandbox.ConsoleSystem.Run( "sbep.smoke_test" );
 
-        // Wait for async smoke test to complete
-        await Task.Delay( 3000 );
+        // Result-driven wait: the smoke ConCmd emits a "=== SMOKE TEST: ... ==="
+        // terminator on completion (SbepEntitySmokeTest.cs:26,61). Poll for it
+        // instead of a blind Task.Delay(3000) so we return as soon as the last
+        // entity is tested — the fixed 3s pinned the shared editor in play mode
+        // even when the test finished in well under 1s
+        // (editor-contention-reduction-plan.md Phase 1.2). Cap at ~3s so a hung or
+        // partial test still returns within the old budget.
+        const int smokeMaxWaitMs = 3000;
+        const int smokePollMs = 50;
+        var after = before;
+        for ( int waited = 0; waited <= smokeMaxWaitMs; waited += smokePollMs )
+        {
+            await Task.Delay( smokePollMs );
+            after = EditorHandler.LogSnapshotText();
+            if ( after.Skip( before.Length ).Any( l => l.Contains( "=== SMOKE TEST:" ) ) )
+                break;
+        }
 
-        var after = EditorHandler.LogSnapshotText();
         var output = after.Skip( before.Length ).ToArray();
 
         // Parse results from log output

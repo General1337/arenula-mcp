@@ -7,29 +7,74 @@ using Sandbox;
 
 namespace Arenula;
 
-/// <summary>schema tool: component/property/resource/enum metadata for safer writes.</summary>
+/// <summary>
+/// schema tool — component/property/resource/enum metadata for safer writes.
+/// Migrated to the [McpTool] attribute scan in mcp-dynamic-discovery Phase 3
+/// Wave 3.2 — read-only multi-action tool, MainThread dispatch.
+/// </summary>
+[McpTool( "schema",
+    "Inspect component, property, resource, and enum metadata from the live editor TypeLibrary. Use this before component writes to discover exact type names, writable properties, accepted value kinds, and enum values. This tool is read-only.",
+    ReadOnlyHint = true )]
 internal static class SchemaHandler
 {
-    internal static object Handle( string action, JsonElement args )
+    // [McpAction] thin wrappers. Each preserves the legacy HandlerBase.Error
+    // response shape — the pre-migration Handle() switch wrapped every arm in
+    // the same try/catch.
+
+    [McpAction( "components", ReadOnly = true )]
+    internal static object HandleComponents( JsonElement args )
     {
-        try
-        {
-            return action switch
-            {
-                "components" => Components( args ),
-                "component"  => ComponentSchema( args ),
-                "property"   => PropertySchema( args ),
-                "resources"  => Resources( args ),
-                "enum"       => EnumSchema( args ),
-                _ => HandlerBase.Error( $"Unknown action '{action}' for tool 'schema'.", action,
-                    "Valid actions: components, component, property, resources, enum" )
-            };
-        }
-        catch ( Exception ex )
-        {
-            return HandlerBase.Error( ex.Message, action );
-        }
+        try { return Components( args ); }
+        catch ( Exception ex ) { return HandlerBase.Error( ex.Message, "components" ); }
     }
+
+    [McpAction( "component", ReadOnly = true )]
+    internal static object HandleComponent( JsonElement args )
+    {
+        try { return ComponentSchema( args ); }
+        catch ( Exception ex ) { return HandlerBase.Error( ex.Message, "component" ); }
+    }
+
+    [McpAction( "property", ReadOnly = true )]
+    internal static object HandleProperty( JsonElement args )
+    {
+        try { return PropertySchema( args ); }
+        catch ( Exception ex ) { return HandlerBase.Error( ex.Message, "property" ); }
+    }
+
+    [McpAction( "resources", ReadOnly = true )]
+    internal static object HandleResources( JsonElement args )
+    {
+        try { return Resources( args ); }
+        catch ( Exception ex ) { return HandlerBase.Error( ex.Message, "resources" ); }
+    }
+
+    [McpAction( "enum", ReadOnly = true )]
+    internal static object HandleEnum( JsonElement args )
+    {
+        try { return EnumSchema( args ); }
+        catch ( Exception ex ) { return HandlerBase.Error( ex.Message, "enum" ); }
+    }
+
+    /// <summary>
+    /// tools/list inputSchema fragment — verbatim copy of the legacy
+    /// <c>ToolRegistry.Schema.inputSchema</c> literal.
+    /// </summary>
+    internal static object InputSchema() => new
+    {
+        type = "object",
+        properties = new Dictionary<string, object>
+        {
+            ["action"] = new { type = "string", description = "Schema lookup operation.", @enum = new[] { "components", "component", "property", "resources", "enum" } },
+            ["type"] = new { type = "string", description = "Component/resource/enum type name. Required for: component, property, enum." },
+            ["property"] = new { type = "string", description = "Property name. Required for: property." },
+            ["filter"] = new { type = "string", description = "Case-insensitive name or namespace filter. Used by: components, resources." },
+            ["offset"] = new { type = "integer", description = "Pagination offset. Default: 0." },
+            ["limit"] = new { type = "integer", description = "Max results. Default: 100." }
+        },
+        required = new[] { "action" },
+        additionalProperties = false
+    };
 
     private static object Components( JsonElement args )
     {

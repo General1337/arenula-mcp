@@ -1,0 +1,75 @@
+// =============================================================================
+//                          FRAME-BASIS ANALYZER SELF-TEST
+//
+// This file ships with the `.cs.disabled` extension on purpose. Do NOT rename
+// it to `.cs` in the committed tree — the disabled state is the gate. The
+// analyzer-fires-on-rename verification is the SOLE purpose of this file:
+//
+//   1. A developer (or CI step) renames this file to `_FrameBasisSelfTest.cs`.
+//   2. They recompile `arenula_mcp.editor.csproj` (the analyzer host).
+//   3. The build is expected to surface:
+//        - FBA001 — untyped Vector3 declarations (one per `Vector3` local /
+//                   field below).
+//        - FBA002 — cross-frame arithmetic (the WorldVec3 + ShipLocalVec3 line
+//                   below; the InvokeMixedFrames(world, shipLocal) call).
+//   4. They restore the `.cs.disabled` extension afterwards.
+//
+// If the rename + rebuild does NOT surface those diagnostics, the analyzer has
+// regressed — either path-filtering is broken, a Roslyn upgrade changed how
+// our `RegisterSyntaxNodeAction` calls fire, or the `<Analyzer Include>` line
+// in the consuming csproj was removed.
+//
+// LOCATION RATIONALE (Phase 2 §4 + Phase 3 decision):
+// Game-side analyzer reach was deferred (see Phase 2 findings §4). The
+// arenula_mcp.editor.csproj is the only csproj that actually applies the
+// analyzer right now, so the self-test fixture lives in this directory — a
+// path the analyzer's IsScannedFile rule does NOT pick up from path filters,
+// because the file's path starts with `/Libraries/arenula_mcp/Editor/`. To
+// make the rename gate fire on this fixture you must EITHER (a) extend
+// IsScannedFile to include this path, OR (b) move the renamed file into
+// `Code/SBEP/Ship/GravityHull/` for the duration of the test, then back.
+//
+// Phase 3's runtime gate (`sbep.test_gh_frame_basis_compile_check`) does NOT
+// rely on this rename mechanism — it asserts the FRAME TYPE INFRASTRUCTURE
+// (record-struct types, FrameConversions extension methods, runtime hull-
+// mismatch guards) at runtime. The rename-on-fixture is a manual / CI gate
+// kept for the IDE-time verification scenario.
+// =============================================================================
+namespace SBEP.Ship.GravityHull.AnalyzerSelfTest;
+
+using Sandbox;
+
+internal static class _FrameBasisSelfTest
+{
+	// FBA001 should fire on each of the following Vector3 declarations
+	// (local / field / parameter / property).
+	private static Vector3 _untypedField;                                 // FBA001 expected
+	public static Vector3 UntypedProperty { get; set; }                   // FBA001 expected
+
+	public static void UntypedParam( Vector3 untypedArg )                 // FBA001 expected
+	{
+		Vector3 untypedLocal = untypedArg;                                // FBA001 expected
+		_untypedField = untypedLocal;
+	}
+
+	// FBA002 should fire on each cross-frame arithmetic site below.
+	public static void CrossFrameArithmetic()
+	{
+		var w = new WorldVec3( Vector3.Zero );
+		var s = new ShipLocalVec3( Vector3.Zero, ShipId.None );
+
+		// BinaryExpression — would also be a compile error because there's
+		// no operator+(WorldVec3, ShipLocalVec3); analyzer catches it first.
+		// var bad = w + s;   // FBA002 — uncomment to verify catch (compile error otherwise).
+
+		// InvocationExpression with two distinct frame-tagged argument types.
+		InvokeMixedFrames( w, s );                                        // FBA002 expected
+	}
+
+	private static void InvokeMixedFrames( WorldVec3 world, ShipLocalVec3 shipLocal )
+	{
+		_untypedField = world.V - shipLocal.V; // explicit .V extraction is documented as a known
+		                                       // gap — the analyzer's FBA002 fires on argument-type
+		                                       // mixing, not on .V-extracted Vector3 args.
+	}
+}

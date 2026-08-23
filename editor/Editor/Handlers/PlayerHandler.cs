@@ -1,5 +1,6 @@
 // editor/Editor/Handlers/PlayerHandler.cs
 using System;
+using System.Collections.Generic;
 using System.Text.Json;
 using Sandbox;
 
@@ -9,8 +10,64 @@ namespace Arenula;
 /// player tool: create, configure_movement, configure_camera, configure_body, configure_interaction.
 /// Curated access to PlayerController's 72 properties, grouped by concern.
 /// </summary>
+[McpTool( "player",
+    "Create and configure PlayerController components for character setup. Use create to add a controller and optional body model. Configure movement, camera, body, and interaction in separate actions so omitted properties retain their current values. This tool mutates scene objects and is intended for editor-time character authoring; use the existing pawn tool instead when driving or observing a live play-mode player." )]
 internal static class PlayerHandler
 {
+    [McpAction( "create", WriteKind = "scene_write" )]
+    internal static object HandleCreate( JsonElement args ) => Handle( "create", args );
+
+    [McpAction( "configure_movement", WriteKind = "scene_write" )]
+    internal static object HandleConfigureMovement( JsonElement args ) => Handle( "configure_movement", args );
+
+    [McpAction( "configure_camera", WriteKind = "scene_write" )]
+    internal static object HandleConfigureCamera( JsonElement args ) => Handle( "configure_camera", args );
+
+    [McpAction( "configure_body", WriteKind = "scene_write" )]
+    internal static object HandleConfigureBody( JsonElement args ) => Handle( "configure_body", args );
+
+    [McpAction( "configure_interaction", WriteKind = "scene_write" )]
+    internal static object HandleConfigureInteraction( JsonElement args ) => Handle( "configure_interaction", args );
+
+    internal static object InputSchema() => new
+    {
+        type = "object",
+        properties = new Dictionary<string, object>
+        {
+            ["action"] = new { type = "string", description = "The operation to perform.", @enum = new[] { "create", "configure_movement", "configure_camera", "configure_body", "configure_interaction" } },
+            ["id"] = new { type = "string", description = "Target GameObject GUID. Required for configure actions; optional for create." },
+            ["name"] = new { type = "string", description = "Object name. Used by create." },
+            ["position"] = new { type = "string", description = "Position as 'x,y,z'. Used by create." },
+            ["body_model"] = new { type = "string", description = "Body model path. Used by create." },
+            ["walk_speed"] = new { type = "number", description = "Walking speed." },
+            ["run_speed"] = new { type = "number", description = "Running speed." },
+            ["ducked_speed"] = new { type = "number", description = "Crouching speed." },
+            ["jump_speed"] = new { type = "number", description = "Jump velocity." },
+            ["acceleration_time"] = new { type = "number", description = "Seconds to accelerate." },
+            ["deacceleration_time"] = new { type = "number", description = "Seconds to decelerate." },
+            ["air_friction"] = new { type = "number", description = "Air friction factor." },
+            ["brake_power"] = new { type = "number", description = "Ground braking friction." },
+            ["run_by_default"] = new { type = "boolean", description = "Run by default and hold to walk." },
+            ["third_person"] = new { type = "boolean", description = "Enable third-person camera." },
+            ["hide_body_in_first_person"] = new { type = "boolean", description = "Hide the body model in first person." },
+            ["camera_offset"] = new { type = "string", description = "Camera offset as 'x,y,z'." },
+            ["eye_distance_from_top"] = new { type = "number", description = "Eye height measured from body top." },
+            ["pitch_clamp"] = new { type = "number", description = "Maximum pitch in degrees." },
+            ["look_sensitivity"] = new { type = "number", description = "Look sensitivity." },
+            ["use_fov_from_preferences"] = new { type = "boolean", description = "Use player FOV preferences." },
+            ["body_height"] = new { type = "number", description = "Standing body height." },
+            ["body_radius"] = new { type = "number", description = "Capsule radius." },
+            ["body_mass"] = new { type = "number", description = "Body mass in kilograms." },
+            ["ducked_height"] = new { type = "number", description = "Crouching body height." },
+            ["collision_tags"] = new { type = "string", description = "Comma-separated collision tags." },
+            ["enable_pressing"] = new { type = "boolean", description = "Enable the use/press interaction system." },
+            ["use_button"] = new { type = "string", description = "Input action name for use." },
+            ["reach_length"] = new { type = "number", description = "Interaction reach distance." }
+        },
+        required = new[] { "action" },
+        additionalProperties = false
+    };
+
     internal static object Handle( string action, JsonElement args )
     {
         try

@@ -21,12 +21,23 @@ public class McpServerWindow : Widget
     [ConVar( "mcp_server_autostart", ConVarFlags.Saved )]
     public static bool AutoStart { get; set; } = true;
 
+    private static McpServerWindow _instance;
+
     // Open via the Editor menu
     [Menu( "Editor", "MCP/Open MCP Panel" )]
     public static void OpenPanel()
     {
-        var win = new McpServerWindow();
-        win.Show();
+        // Reuse the live panel. Constructing one per menu click stacked a new event subscription
+        // each time, and closing the panel never removed it (see DeleteOnClose in the ctor).
+        if ( _instance is { IsValid: true } )
+        {
+            _instance.Show();
+            _instance.Focus();
+            return;
+        }
+
+        _instance = new McpServerWindow();
+        _instance.Show();
     }
 
     // Static constructor runs once when the library assembly is loaded by the editor.
@@ -43,6 +54,11 @@ public class McpServerWindow : Widget
         WindowTitle = "Arenula MCP Server";
         MinimumSize = new Vector2( 500, 400 );
 
+        // Widget.Close() only hides — Window sets this flag in its own ctor, a bare Widget does not.
+        // Without it the panel survives being closed, stays subscribed below, and keeps building
+        // Labels for every server log line. OnDestroyed (and therefore the unsubscribe) never ran.
+        DeleteOnClose = true;
+
         ArenulaMcpServer.OnServerStateChanged += OnStateChanged;
         ArenulaMcpServer.OnLogMessage += OnLogMessage;
 
@@ -54,6 +70,10 @@ public class McpServerWindow : Widget
     {
         ArenulaMcpServer.OnServerStateChanged -= OnStateChanged;
         ArenulaMcpServer.OnLogMessage -= OnLogMessage;
+
+        if ( ReferenceEquals( _instance, this ) )
+            _instance = null;
+
         base.OnDestroyed();
     }
 
@@ -190,7 +210,13 @@ public class McpServerWindow : Widget
 
     private void OnStateChanged()
     {
-        if ( !IsValid ) return;
+        // A dead widget still holding a subscription can only have got here via a path that skipped
+        // OnDestroyed (hotload). Drop it rather than no-op on every future log line.
+        if ( !IsValid )
+        {
+            ArenulaMcpServer.OnServerStateChanged -= OnStateChanged;
+            return;
+        }
 
         _portLabel.Text = ArenulaMcpServer.Port.ToString();
         _sessionCountLabel.Text = ArenulaMcpServer.SessionCount.ToString();
@@ -211,7 +237,11 @@ public class McpServerWindow : Widget
 
     private void OnLogMessage( string message )
     {
-        if ( !IsValid ) return;
+        if ( !IsValid )
+        {
+            ArenulaMcpServer.OnLogMessage -= OnLogMessage;
+            return;
+        }
 
         var text = $"[{DateTime.Now:HH:mm:ss}] {message}";
         _logEntries.Add( text );

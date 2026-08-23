@@ -22,8 +22,16 @@ namespace Arenula;
 /// </summary>
 public static class ArenulaMcpServer
 {
+    internal const long MaxRequestSizeBytes = 8L * 1024L * 1024L;
+
     [ConVar( "mcp_server_port", ConVarFlags.Saved )]
     public static int Port { get; set; } = 8098;
+
+    [ConVar( "mcp_log_session_lifecycle", ConVarFlags.Saved )]
+    public static bool LogSessionLifecycle { get; set; } = false;
+
+    [ConVar( "mcp_log_disconnect_errors", ConVarFlags.Saved )]
+    public static bool LogDisconnectErrors { get; set; } = false;
 
     // ── GUI events & state ─────────────────────────────────────────────────
     public static event Action OnServerStateChanged;
@@ -31,14 +39,33 @@ public static class ArenulaMcpServer
     public static bool IsRunning   => _listener != null && _listener.IsListening;
     public static int  SessionCount => _sessions.Count;
 
-    /// <summary>Safely dispatches an action to the main thread, swallowing exceptions if the thread is gone (e.g. during cancel).</summary>
+    /// <summary>
+    /// Dispatches an action to the main thread, swallowing exceptions if the thread is gone (e.g.
+    /// during cancel). Fire-and-forget: the action has usually NOT run by the time this returns.
+    /// </summary>
+    /// <remarks>
+    /// Must hop via <c>GameTask.MainThread()</c>, never <c>GameTask.RunInThreadAsync()</c> — the
+    /// latter posts to <c>SyncContext.WorkerThread</c>. Subscribers of <see cref="OnLogMessage"/> and
+    /// <see cref="OnServerStateChanged"/> touch editor widgets, and every Qt widget constructor calls
+    /// <c>InteropSystem.Alloc</c>, which asserts the main thread.
+    /// </remarks>
     private static async void SafeRunOnMainThread( Action action )
     {
         try
         {
-            await GameTask.RunInThreadAsync( action );
+            await GameTask.MainThread();
+            action();
         }
         catch { /* Main thread unavailable (cancelled / disposed) – safe to ignore */ }
+    }
+
+    /// <summary>
+    /// Raises <see cref="OnLogMessage"/> on the main thread. Never invoke the event directly from a
+    /// request handler: those run on HTTP worker threads and subscribers build Qt widgets.
+    /// </summary>
+    internal static void RaiseLogMessage( string msg )
+    {
+        SafeRunOnMainThread( () => OnLogMessage?.Invoke( msg ) );
     }
 
     private static void LogInfo( string msg )
@@ -68,6 +95,38 @@ public static class ArenulaMcpServer
         } );
     }
 
+    private static void LogSessionLifecycleInfo( string msg )
+    {
+        if ( LogSessionLifecycle )
+            LogInfo( msg );
+        else
+            RaiseLogMessage( $"[TRACE] {msg}" );
+    }
+
+    private static void LogConnectionError( string prefix, Exception ex )
+    {
+        if ( IsExpectedClientDisconnect( ex ) && !LogDisconnectErrors )
+        {
+            RaiseLogMessage( $"[TRACE] {prefix}: {ex.Message}" );
+            return;
+        }
+
+        // Full exception, not just Message: a bare .Message discards the stack, which is the only
+        // thing that identifies which subscriber or handler actually threw.
+        LogError( $"{prefix}: {ex}" );
+    }
+
+    private static bool IsExpectedClientDisconnect( Exception ex )
+    {
+        var msg = ex.Message ?? "";
+        return ex is IOException
+            || ex is ObjectDisposedException
+            || msg.Contains( "nonexistent network connection", StringComparison.OrdinalIgnoreCase )
+            || msg.Contains( "forcibly closed", StringComparison.OrdinalIgnoreCase )
+            || msg.Contains( "broken pipe", StringComparison.OrdinalIgnoreCase )
+            || msg.Contains( "An existing connection was forcibly closed", StringComparison.OrdinalIgnoreCase );
+    }
+
     private static void NotifyStateChanged()
     {
         SafeRunOnMainThread( () => OnServerStateChanged?.Invoke() );
@@ -95,7 +154,10 @@ public static class ArenulaMcpServer
     };
 
     // ── Global log capture ────────────────────────────────────────────────
-    private static bool _loggerHooked;
+    //
+    // Deliberately no `_loggerHooked` flag: it was a static, a hot-reload reset it to false, and
+    // gating RemoveLogger on it leaked one OnGlobalLog registration per hotload. AddLogger/RemoveLogger
+    // are idempotent enough to call unconditionally, which is what EditorHandler already does.
 
     private static void OnGlobalLog( LogEvent e )
     {
@@ -125,6 +187,9 @@ public static class ArenulaMcpServer
         // (silent editor-wide breakage — extremely hard to diagnose).
         try
         {
+            // Drop reflection records from the outgoing editor assembly before
+            // the restarted listener can accept a tools/list or tools/call.
+            McpToolScanner.Invalidate();
             if ( IsRunning ) StopServer();
             StartServer();
         }
@@ -144,12 +209,14 @@ public static class ArenulaMcpServer
 
         try
         {
-            // Hook into the global editor log stream
-            if ( !_loggerHooked )
-            {
-                EditorUtility.AddLogger( OnGlobalLog );
-                _loggerHooked = true;
-            }
+            // Hook into the global editor log stream. The RemoveLogger is unconditional and
+            // idempotent — same pattern as EditorHandler.EnsureInitialized, for the same reason.
+            // Guarding it behind a static flag leaked one surplus OnGlobalLog registration per
+            // hotload, so every engine log line fanned out N times into the MCP ring buffer.
+            // Measured at 7 live registrations on 2026-07-09 (vs 1 for OnEngineLog, which already
+            // removed unconditionally).
+            try { EditorUtility.RemoveLogger( OnGlobalLog ); } catch { }
+            EditorUtility.AddLogger( OnGlobalLog );
 
             _listener = new HttpListener();
             _listener.Prefixes.Add( $"http://localhost:{Port}/" );
@@ -172,12 +239,8 @@ public static class ArenulaMcpServer
     {
         try
         {
-            // Unhook the global logger
-            if ( _loggerHooked )
-            {
-                EditorUtility.RemoveLogger( OnGlobalLog );
-                _loggerHooked = false;
-            }
+            // Unhook the global logger. Unconditional — see the note at OnGlobalLog.
+            try { EditorUtility.RemoveLogger( OnGlobalLog ); } catch { }
 
             _cts?.Cancel();
 
@@ -186,7 +249,7 @@ public static class ArenulaMcpServer
             _listener = null;
 
             // Don't wait for in-flight tasks — they may be blocked waiting for the
-            // main thread (GameTask.RunInThreadAsync) which would deadlock here.
+            // main thread (GameTask.MainThread) which would deadlock here.
             // Just clear the tracking dictionary; the tasks will see the cancelled token
             // and wind down on their own.
             _inflightTasks.Clear();
@@ -211,16 +274,41 @@ public static class ArenulaMcpServer
 
     private static async Task ListenLoop( CancellationToken token )
     {
-        while ( !token.IsCancellationRequested && _listener != null && _listener.IsListening )
+        while ( !token.IsCancellationRequested )
         {
+            var listener = _listener;
+            if ( listener == null || !listener.IsListening )
+                break;
+
             try
             {
-                var context = await _listener.GetContextAsync();
-                _ = Task.Run( () => HandleContext( context ), token );
+                var context = await listener.GetContextAsync();
+
+                // Observe the task's fault. Discarding it meant any exception escaping HandleContext
+                // went unobserved and was rethrown by the finalizer thread.
+                _ = Task.Run( () => HandleContext( context ), token )
+                    .ContinueWith(
+                        t => LogError( $"Unhandled MCP request failure: {t.Exception?.GetBaseException()}" ),
+                        CancellationToken.None,
+                        TaskContinuationOptions.OnlyOnFaulted,
+                        TaskScheduler.Default );
             }
-            catch ( Exception ex ) when ( ex is not ObjectDisposedException )
+            catch ( ObjectDisposedException ) when ( token.IsCancellationRequested || _listener == null )
+            {
+                break;
+            }
+            catch ( HttpListenerException ) when ( token.IsCancellationRequested || _listener == null )
+            {
+                break;
+            }
+            catch ( InvalidOperationException ) when ( token.IsCancellationRequested || _listener == null )
+            {
+                break;
+            }
+            catch ( Exception ex )
             {
                 LogError( $"Error in MCP listen loop: {ex.Message}" );
+                try { await Task.Delay( 100, token ); } catch { break; }
             }
         }
     }
@@ -251,9 +339,17 @@ public static class ArenulaMcpServer
         }
         catch ( Exception ex )
         {
-            LogError( $"Error handling MCP request: {ex.Message}" );
-            res.StatusCode = 500;
-            res.Close();
+            LogError( $"Error handling MCP request: {ex}" );
+
+            // The handler that threw may already have closed the response or sent its headers.
+            // Touching it here then throws OUT of this catch block — that is how a single handler
+            // fault used to escape HandleContext entirely and surface as a disposed-object warning.
+            try
+            {
+                res.StatusCode = 500;
+                res.Close();
+            }
+            catch { /* response already closed / headers sent */ }
         }
     }
 
@@ -382,8 +478,12 @@ public static class ArenulaMcpServer
             return;
         }
 
-        using var reader = new StreamReader( req.InputStream, Encoding.UTF8 );
-        var body = await reader.ReadToEndAsync();
+        var body = await ReadRequestBody( req );
+        if ( body == null )
+        {
+            await WritePayloadTooLargeResponse( res );
+            return;
+        }
 
         try
         {
@@ -524,6 +624,48 @@ public static class ArenulaMcpServer
         res.Close();
     }
 
+    /// <summary>
+    /// Read one request body without allowing fixed-length or chunked clients to
+    /// allocate beyond <see cref="MaxRequestSizeBytes"/>. Content-Length is an
+    /// early rejection hint only; chunked requests report -1, so the stream itself
+    /// remains the authority.
+    /// </summary>
+    private static async Task<string> ReadRequestBody( HttpListenerRequest req )
+    {
+        if ( req.ContentLength64 > MaxRequestSizeBytes )
+            return null;
+
+        var initialCapacity = req.ContentLength64 is > 0 and <= MaxRequestSizeBytes
+            ? (int)req.ContentLength64
+            : 0;
+
+        using var buffer = initialCapacity > 0
+            ? new MemoryStream( initialCapacity )
+            : new MemoryStream();
+        var chunk = new byte[81920];
+
+        int read;
+        while ( (read = await req.InputStream.ReadAsync( chunk, 0, chunk.Length )) > 0 )
+        {
+            buffer.Write( chunk, 0, read );
+            if ( buffer.Length > MaxRequestSizeBytes )
+                return null;
+        }
+
+        return req.ContentEncoding.GetString( buffer.GetBuffer(), 0, (int)buffer.Length );
+    }
+
+    private static Task WritePayloadTooLargeResponse( HttpListenerResponse res )
+    {
+        var json = JsonSerializer.Serialize( new
+        {
+            error = "request_too_large",
+            message = $"MCP request body exceeds the {MaxRequestSizeBytes}-byte limit.",
+            max_bytes = MaxRequestSizeBytes
+        }, JsonOptions );
+        return WriteJsonResponse( res, (int)HttpStatusCode.RequestEntityTooLarge, json );
+    }
+
     private static void WriteAcceptedResponse( HttpListenerResponse res, string sessionId = null )
     {
         res.StatusCode = 202;
@@ -569,10 +711,15 @@ public static class ArenulaMcpServer
             // Streamable HTTP does not use the legacy SSE "endpoint" bootstrap event.
             // A comment opens the stream without delivering a protocol message.
             var connected = Encoding.UTF8.GetBytes( ": connected\n\n" );
-            await res.OutputStream.WriteAsync( connected, 0, connected.Length );
-            await res.OutputStream.FlushAsync();
+            await session.WriteLock.WaitAsync();
+            try
+            {
+                await res.OutputStream.WriteAsync( connected, 0, connected.Length );
+                await res.OutputStream.FlushAsync();
+            }
+            finally { session.WriteLock.Release(); }
 
-            LogInfo( $"Created MCP streamable HTTP session: {sessionId}" );
+            LogSessionLifecycleInfo( $"Created MCP streamable HTTP session: {sessionId}" );
             NotifyStateChanged();
 
             while ( !_cts.IsCancellationRequested )
@@ -580,16 +727,23 @@ public static class ArenulaMcpServer
                 var done = await Task.WhenAny( session.Tcs.Task, Task.Delay( 30_000 ) );
                 if ( done == session.Tcs.Task || _cts.IsCancellationRequested ) break;
                 var ping = Encoding.UTF8.GetBytes( ": ping\n\n" );
-                await res.OutputStream.WriteAsync( ping, 0, ping.Length );
-                await res.OutputStream.FlushAsync();
+                await session.WriteLock.WaitAsync();
+                try
+                {
+                    await res.OutputStream.WriteAsync( ping, 0, ping.Length );
+                    await res.OutputStream.FlushAsync();
+                }
+                finally { session.WriteLock.Release(); }
             }
         }
-        catch ( Exception ex ) { LogError( $"MCP streamable HTTP connection error: {ex.Message}" ); }
+        catch ( Exception ex ) { LogConnectionError( "MCP streamable HTTP connection error", ex ); }
         finally
         {
-            _sessions.TryRemove( sessionId, out _ );
+            // [HANDOFF-TRUST: engine-fork-phase3-1-library-mvp Phase 5 session-close lock release; Path C committed-design plumbing, independent of any inherited ranked hypothesis — Phase 1 already falsified the RFC editor-mutex-layer claim.]
+            _sessions.TryRemove( sessionId, out var closedSession );
+            ReleaseSessionLocks( sessionId, closedSession );
             try { res.Close(); } catch { }
-            LogInfo( $"Closed MCP streamable HTTP session: {sessionId}" );
+            LogSessionLifecycleInfo( $"Closed MCP streamable HTTP session: {sessionId}" );
             NotifyStateChanged();
         }
     }
@@ -610,10 +764,15 @@ public static class ArenulaMcpServer
         {
             var msg    = $"event: endpoint\ndata: /message?sessionId={sessionId}\n\n";
             var buffer = Encoding.UTF8.GetBytes( msg );
-            await res.OutputStream.WriteAsync( buffer, 0, buffer.Length );
-            await res.OutputStream.FlushAsync();
+            await session.WriteLock.WaitAsync();
+            try
+            {
+                await res.OutputStream.WriteAsync( buffer, 0, buffer.Length );
+                await res.OutputStream.FlushAsync();
+            }
+            finally { session.WriteLock.Release(); }
 
-            LogInfo( $"Created new MCP SSE session: {sessionId}" );
+            LogSessionLifecycleInfo( $"Created new MCP SSE session: {sessionId}" );
             NotifyStateChanged();
 
             // Ping every 30 s so we detect when the client disconnects
@@ -622,16 +781,23 @@ public static class ArenulaMcpServer
                 var done = await Task.WhenAny( session.Tcs.Task, Task.Delay( 30_000 ) );
                 if ( done == session.Tcs.Task || _cts.IsCancellationRequested ) break;
                 var ping = Encoding.UTF8.GetBytes( ": ping\n\n" );
-                await res.OutputStream.WriteAsync( ping, 0, ping.Length );
-                await res.OutputStream.FlushAsync(); // throws if client is gone → caught below
+                await session.WriteLock.WaitAsync();
+                try
+                {
+                    await res.OutputStream.WriteAsync( ping, 0, ping.Length );
+                    await res.OutputStream.FlushAsync(); // throws if client is gone → caught below
+                }
+                finally { session.WriteLock.Release(); }
             }
         }
-        catch ( Exception ex ) { LogError( $"SSE connection error: {ex.Message}" ); }
+        catch ( Exception ex ) { LogConnectionError( "SSE connection error", ex ); }
         finally
         {
-            _sessions.TryRemove( sessionId, out _ );
+            // [HANDOFF-TRUST: engine-fork-phase3-1-library-mvp Phase 5 session-close lock release; Path C committed-design plumbing, independent of any inherited ranked hypothesis — Phase 1 already falsified the RFC editor-mutex-layer claim.]
+            _sessions.TryRemove( sessionId, out var closedSession );
+            ReleaseSessionLocks( sessionId, closedSession );
             try { res.Close(); } catch { }
-            LogInfo( $"Closed MCP SSE session: {sessionId}" );
+            LogSessionLifecycleInfo( $"Closed MCP SSE session: {sessionId}" );
             NotifyStateChanged();
         }
     }
@@ -646,8 +812,12 @@ public static class ArenulaMcpServer
             res.StatusCode = 400; res.Close(); return;
         }
 
-        using var reader = new StreamReader( req.InputStream, Encoding.UTF8 );
-        var body = await reader.ReadToEndAsync();
+        var body = await ReadRequestBody( req );
+        if ( body == null )
+        {
+            await WritePayloadTooLargeResponse( res );
+            return;
+        }
 
         try
         {
@@ -712,12 +882,43 @@ public static class ArenulaMcpServer
         }
     }
 
+    // ── Session lock release ──────────────────────────────────────────────
+
+    // [HANDOFF-TRUST: engine-fork-phase3-1-library-mvp Phase 5 — on SSE/streamable session close, evict the dropped agent's Coordinator operation leases and per-GameObject locks so a disconnected agent never strands cross-session contention state. Connection-drop is the PRIMARY lock-release signal per the Path C committed design. No inherited handoff hypothesis applies.]
+    /// <summary>Releases all MCP lock state owned by a closing session.</summary>
+    private static void ReleaseSessionLocks( string sessionId, McpSession session )
+    {
+        if ( string.IsNullOrEmpty( sessionId ) ) return;
+        try
+        {
+            var evicted = McpOperationCoordinator.EvictBySession( sessionId );
+            var released = 0;
+            if ( session?.AgentId is { Length: > 0 } agentId )
+            {
+                released = GameObjectLockMap.ReleaseAll( agentId );
+                // engine-fork-elite-leverage Phase 3.3 — flag the dropped agent's
+                // scratch container for lazy reaping. In-memory ONLY: GameObject
+                // .DestroyImmediate requires the MainThread and this SSE-close
+                // path is not guaranteed to be on it. The actual destroy happens
+                // on the next MainThread pool op (plan.md §3.2 / §4).
+                ScratchScenePool.MarkForReap( agentId );
+            }
+            if ( evicted > 0 || released > 0 )
+                LogInfo( $"Session {sessionId[..Math.Min( 8, sessionId.Length )]} close: evicted {evicted} operation lease(s), released {released} GameObject lock(s)." );
+        }
+        catch ( Exception ex )
+        {
+            LogError( $"ReleaseSessionLocks failed for session {sessionId}: {ex.Message}" );
+        }
+    }
+
     // ── SSE write ──────────────────────────────────────────────────────────
 
     /// <summary>Writes a single SSE event to the given session's output stream.</summary>
     internal static async Task SendSseEvent( McpSession session, string eventName, string data )
     {
         if ( session.SseResponse == null || !session.SseResponse.OutputStream.CanWrite ) return;
+        await session.WriteLock.WaitAsync();
         try
         {
             var msg    = $"event: {eventName}\ndata: {data}\n\n";
@@ -728,6 +929,10 @@ public static class ArenulaMcpServer
         catch ( Exception ex )
         {
             LogWarning( $"Failed to send SSE event to session {session.SessionId}: {ex.Message}" );
+        }
+        finally
+        {
+            session.WriteLock.Release();
         }
     }
 }

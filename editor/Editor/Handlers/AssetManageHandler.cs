@@ -309,7 +309,77 @@ internal static class AssetManageHandler
         if ( asset == null )
             return HandlerBase.Error( $"Asset not found: '{path}'.", "reload" );
 
+        // Fail fast when the asset is referenced by a currently loaded scene
+        // (findings #5, 2026-06-11). Recompiling a live-referenced asset can blank
+        // or corrupt loaded scene state ("MCP self-heals but not 100%"). The cheap
+        // disk-text scan of each open scene's source file catches the common case
+        // BEFORE damage instead of after. Newly imported assets are not referenced
+        // by any scene yet, so the post-import "reload if invisible" flow is unaffected.
+        var force = HandlerBase.GetBool( args, "force", false );
+        if ( !force )
+        {
+            var referencedBy = FindLoadedSceneReferences( asset );
+            if ( referencedBy.Count > 0 )
+            {
+                return HandlerBase.Error(
+                    $"REFUSED: '{asset.Path}' is referenced by the currently loaded scene(s): " +
+                    $"{string.Join( ", ", referencedBy )}. Recompiling a live-referenced asset risks wiping or " +
+                    $"corrupting loaded scene state.",
+                    "reload",
+                    "Save your work and close/switch the scene first, or pass force:true to recompile anyway. " +
+                    "After a forced reload, run editor.reload_scene and check integrity.verified before any save_scene.",
+                    new { assetPath = asset.Path, referencedByLoadedScenes = referencedBy },
+                    McpErrorCode.ReloadRefusedSceneReferenced );
+            }
+        }
+
         asset.Compile( true );
-        return HandlerBase.Confirm( $"Recompile triggered for '{path}'." );
+        return HandlerBase.Confirm( $"Recompile triggered for '{path}'."
+            + ( force ? " (forced past loaded-scene reference check)" : "" ) );
+    }
+
+    /// <summary>
+    /// Scene resource paths among open editor sessions whose on-disk source text
+    /// references the asset — or that ARE the asset, for .scene reloads (highest risk).
+    /// Disk-text substring scan: scene JSON stores source-relative asset paths
+    /// (e.g. "meshy/thruster/thruster.vmdl"), which is exactly Asset.Path. Indirect
+    /// references (a .vmat used by a .vmdl placed in the scene) are NOT caught —
+    /// that would need a transitive GetReferences walk; documented limitation.
+    /// </summary>
+    private static List<string> FindLoadedSceneReferences( Asset asset )
+    {
+        var hits = new List<string>();
+        var assetPath = asset?.Path?.Replace( '\\', '/' );
+        if ( string.IsNullOrEmpty( assetPath ) ) return hits;
+
+        IEnumerable<SceneEditorSession> sessions;
+        try { sessions = SceneEditorSession.All ?? new List<SceneEditorSession>(); }
+        catch { return hits; }
+
+        foreach ( var session in sessions )
+        {
+            string scenePath = null;
+            try { scenePath = session?.Scene?.Source?.ResourcePath; } catch { }
+            if ( string.IsNullOrEmpty( scenePath ) ) continue;
+            var normScene = scenePath.Replace( '\\', '/' );
+
+            // Reloading the loaded scene file itself is the direct scene-wipe case.
+            if ( string.Equals( normScene, assetPath, StringComparison.OrdinalIgnoreCase ) )
+            {
+                hits.Add( normScene + " (is the loaded scene itself)" );
+                continue;
+            }
+
+            try
+            {
+                var abs = SceneIntegrityGuard.ResolveAbsolutePath( scenePath );
+                if ( string.IsNullOrEmpty( abs ) || !System.IO.File.Exists( abs ) ) continue;
+                var text = System.IO.File.ReadAllText( abs );
+                if ( text.IndexOf( assetPath, StringComparison.OrdinalIgnoreCase ) >= 0 )
+                    hits.Add( normScene );
+            }
+            catch { }
+        }
+        return hits;
     }
 }

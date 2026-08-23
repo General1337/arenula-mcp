@@ -104,7 +104,8 @@ internal static class TransactionHandler
             var tool = op.GetProperty( "tool" ).GetString();
             var opAction = op.GetProperty( "action" ).GetString();
             var merged = BatchHandler.MergeActionAndParams( opAction, op.TryGetProperty( "params", out var p ) ? p : default );
-            var result = BatchHandler.DispatchToHandler( tool, opAction, merged );
+            // [HANDOFF-TRUST: engine-fork-phase3-1-library-mvp Phase 3 — transaction.apply dispatches per-op handlers internally without McpSession; passing null is safe for Phase 3 (session.identify is not a valid transaction op). Phase 4 will thread McpSession through TransactionHandler to wire per-key Coordinator extraction across the transaction's ops. No inherited handoff hypothesis applies.]
+            var result = BatchHandler.DispatchToHandler( tool, opAction, merged, null );
             tx.LastResults.Add( new { tool, action = opAction, result } );
             tx.AppliedOps++;
 
@@ -181,11 +182,5 @@ internal static class TransactionHandler
     }
 
     private static bool IsToolError( object result )
-    {
-        try
-        {
-            return JsonSerializer.Serialize( result ).Contains( "\"isError\":true", StringComparison.OrdinalIgnoreCase );
-        }
-        catch { return false; }
-    }
+        => McpResult.IsErrorResult( result );
 }

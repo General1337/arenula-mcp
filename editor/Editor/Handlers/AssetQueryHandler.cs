@@ -3,6 +3,7 @@ using System;
 using System.Collections.Generic;
 using System.Linq;
 using System.Text.Json;
+using System.Text.RegularExpressions;
 using Editor;
 using Sandbox;
 
@@ -20,6 +21,11 @@ internal static class AssetQueryHandler
 {
     internal static object Handle( string action, JsonElement args )
     {
+        // Lazy-subscribe to the engine logger on first call. We do this here rather than
+        // in a static ctor because static ctors run during plugin load when EditorUtility
+        // wiring isn't necessarily safe yet — same defensive pattern as
+        // EditorHandler.EnsureInitialized.
+        EnsureCompileErrorSubscription();
         try
         {
             return action switch
@@ -36,14 +42,243 @@ internal static class AssetQueryHandler
                 "get_status"              => GetStatus( args ),
                 "get_json"                => GetJson( args ),
                 "get_references"          => GetReferences( args ),
+                "get_compile_errors"      => GetCompileErrors( args ),
                 _ => HandlerBase.Error( $"Unknown action '{action}'", action,
-                    "Valid actions: browse, search, open, get_dependencies, get_model_info, get_material_properties, get_mesh_info, get_bounds, get_unsaved, get_status, get_json, get_references" )
+                    "Valid actions: browse, search, open, get_dependencies, get_model_info, get_material_properties, get_mesh_info, get_bounds, get_unsaved, get_status, get_json, get_references, get_compile_errors" )
             };
         }
         catch ( Exception ex )
         {
             return HandlerBase.Error( ex.Message, action );
         }
+    }
+
+    // ── get_compile_errors backing store ──────────────────────────────────
+    //
+    // Per-asset resource-compile failures, captured by subscribing to the engine logger
+    // and parsing the path out of "Failed to compile <path>" / "Resource compile error"
+    // / "Compile error in" lines. The C# compiler error path is already covered by the
+    // 'compile' tool (CompileHandler._lastOutputs); this is the *resource* compiler
+    // (.vmat / .vmdl / .shader / .png), which has no public event surface
+    // (verified 2026-05-09 via mcp__sbox-editor__reflection — Sandbox.Resources.*
+    // compilers are abstract, no AllGroups static accessor, no per-asset event).
+    //
+    // LRU eviction: append-at-tail, drop-from-head. _byPath preserves O(1) lookup +
+    // O(1) move-to-back on duplicate path; _order owns iteration order.
+
+    internal sealed record CompileError(
+        string Path,        // forward-slashed, lowercase for stable filtering
+        string Message,
+        DateTime Utc,
+        string Kind );      // "vmat" | "vmdl" | "shader" | "tmat" | "texture" | "fbx" | "other"
+
+    private const int _compileErrorsCap = 100;
+    internal const int CompileErrorsCap = _compileErrorsCap;
+
+    private static readonly Dictionary<string, LinkedListNode<CompileError>> _byPath
+        = new( StringComparer.OrdinalIgnoreCase );
+    private static readonly LinkedList<CompileError> _order = new();
+    private static readonly object _compileErrorsLock = new();
+    private static DateTime _compileErrorsCapturedAt = DateTime.MinValue;
+
+    private static bool _compileErrorSubscribed;
+    private static readonly object _compileErrorSubscribeLock = new();
+
+    // Path-extraction regex — matches a typical asset filename anywhere in the message.
+    // Supports forward + backslash separators (engine emits both depending on platform).
+    private static readonly Regex _assetPathRegex = new(
+        @"\b([\w\-/\\.]+\.(vmat|vmdl|shader|tmat|png|jpg|tga|fbx|sound|sbproj))\b",
+        RegexOptions.IgnoreCase | RegexOptions.Compiled );
+
+    private static void EnsureCompileErrorSubscription()
+    {
+        if ( _compileErrorSubscribed ) return;
+        lock ( _compileErrorSubscribeLock )
+        {
+            if ( _compileErrorSubscribed ) return;
+            try
+            {
+                // Defensive RemoveLogger first — idempotent across hot-reload cycles
+                // that re-load this static class (mirror of EditorHandler pattern).
+                try { EditorUtility.RemoveLogger( OnEngineLogForCompileErrors ); } catch { }
+                EditorUtility.AddLogger( OnEngineLogForCompileErrors );
+                _compileErrorSubscribed = true;
+            }
+            catch ( Exception ex )
+            {
+                try { Log.Error( $"AssetQueryHandler.EnsureCompileErrorSubscription faulted: {ex.Message}" ); } catch { }
+            }
+        }
+    }
+
+    private static void OnEngineLogForCompileErrors( LogEvent ev )
+    {
+        try
+        {
+            // Only resource-compile-class lines. Two filter axes:
+            //   1. Logger name — engine resource compilers use a stable "engine/<XCompiler>"
+            //      logger family. This is the strongest signal because the engine emits a
+            //      compiler diagnostic THROUGH the named logger regardless of message text.
+            //      Wave-2 finding 2026-05-09: the synthetic ghost_invalid.vmat test fired
+            //      "Feature combo not found" via engine/MaterialCompiler — a pure message-text
+            //      filter would have missed every "soft" material/shader compile failure.
+            //   2. Message-text token — backstop for compilers that don't tag their logger
+            //      consistently (some legacy paths log via Sandbox.Log directly).
+            var msg = ev.Message ?? string.Empty;
+            if ( msg.Length == 0 ) return;
+            var logger = ev.Logger ?? string.Empty;
+
+            bool loggerMatch =
+                logger.IndexOf( "MaterialCompiler", StringComparison.OrdinalIgnoreCase ) >= 0 ||
+                logger.IndexOf( "ShaderCompiler",   StringComparison.OrdinalIgnoreCase ) >= 0 ||
+                logger.IndexOf( "ResourceCompiler", StringComparison.OrdinalIgnoreCase ) >= 0 ||
+                logger.IndexOf( "TextureCompiler",  StringComparison.OrdinalIgnoreCase ) >= 0 ||
+                logger.IndexOf( "ModelCompiler",    StringComparison.OrdinalIgnoreCase ) >= 0;
+
+            bool messageMatch =
+                msg.IndexOf( "failed to compile",        StringComparison.OrdinalIgnoreCase ) >= 0 ||
+                msg.IndexOf( "resource compile error",   StringComparison.OrdinalIgnoreCase ) >= 0 ||
+                msg.IndexOf( "compile error in",         StringComparison.OrdinalIgnoreCase ) >= 0 ||
+                msg.IndexOf( "shader compile error",     StringComparison.OrdinalIgnoreCase ) >= 0;
+
+            if ( !loggerMatch && !messageMatch ) return;
+
+            // Asset-path extraction — first match wins. If nothing parses, store with
+            // path="<unparsed>" so the agent can still see the noise (better to surface
+            // signal we can't classify than to drop it silently).
+            var m = _assetPathRegex.Match( msg );
+            string path, kind;
+            if ( m.Success )
+            {
+                path = m.Groups[1].Value.Replace( '\\', '/' ).ToLowerInvariant();
+                kind = m.Groups[2].Value.ToLowerInvariant() switch
+                {
+                    "vmat"   => "vmat",
+                    "vmdl"   => "vmdl",
+                    "shader" => "shader",
+                    "tmat"   => "tmat",
+                    "png" or "jpg" or "tga" => "texture",
+                    "fbx"    => "fbx",
+                    "sound"  => "sound",
+                    _        => "other"
+                };
+            }
+            else
+            {
+                // No recognizable asset path in the message — common for compiler-logger
+                // matches like "Feature combo not found" from engine/MaterialCompiler.
+                // Embed a ms-precision timestamp so each unparseable entry gets a unique
+                // dict key (otherwise N back-to-back compiler diagnostics would all
+                // collapse onto a single "<unparsed>" entry under the LRU dedup logic).
+                var when = ev.Time == default ? DateTime.UtcNow : ev.Time.ToUniversalTime();
+                path = $"<unparsed:{when:HHmmssfff}>";
+                kind = "other";
+            }
+
+            var entry = new CompileError(
+                Path:    path,
+                Message: msg,
+                Utc:     ev.Time == default ? DateTime.UtcNow : ev.Time.ToUniversalTime(),
+                Kind:    kind );
+
+            lock ( _compileErrorsLock )
+            {
+                _compileErrorsCapturedAt = entry.Utc;
+                if ( _byPath.TryGetValue( path, out var existing ) )
+                {
+                    _order.Remove( existing );
+                    _byPath.Remove( path );
+                }
+                var node = _order.AddLast( entry );
+                _byPath[path] = node;
+                while ( _order.Count > _compileErrorsCap )
+                {
+                    var head = _order.First;
+                    if ( head == null ) break;
+                    _byPath.Remove( head.Value.Path );
+                    _order.RemoveFirst();
+                }
+            }
+        }
+        catch
+        {
+            // Best-effort capture — never let a logger callback fault.
+        }
+    }
+
+    // ── get_compile_errors ────────────────────────────────────────────────
+    // Returns the LRU dict of recent per-asset compile failures, newest first.
+    // Optional path prefix + kind filters with directory-boundary safety.
+    //
+    // Params:
+    //   path  — case-insensitive prefix filter ("materials/sbep/" narrows to that dir)
+    //   kind  — single extension class filter ("vmat" / "shader" / "texture" / etc.)
+    //   count — trim to last N after filtering (default = all, capped by _compileErrorsCap)
+
+    private static object GetCompileErrors( JsonElement args )
+    {
+        var pathFilter = HandlerBase.GetString( args, "path"  );
+        var kindFilter = HandlerBase.GetString( args, "kind"  );
+        var count      = HandlerBase.GetInt(    args, "count", 0 );
+
+        CompileError[] all;
+        DateTime capturedAt;
+        int total;
+        lock ( _compileErrorsLock )
+        {
+            all = new CompileError[_order.Count];
+            int i = 0;
+            for ( var node = _order.Last; node != null; node = node.Previous, i++ )
+                all[i] = node.Value;
+            capturedAt = _compileErrorsCapturedAt;
+            total = _order.Count;
+        }
+
+        IEnumerable<CompileError> filtered = all;
+
+        if ( !string.IsNullOrWhiteSpace( pathFilter ) )
+        {
+            // Directory boundary check — same trick as Browse: prevent "foo" matching
+            // "foobar/asset.vmat" by ensuring the prefix ends at a path separator.
+            var dir = pathFilter.Trim().Trim( '/', '\\' ).Replace( '\\', '/' ).ToLowerInvariant();
+            var dirWithSlash = dir.Length > 0 ? dir + "/" : "";
+            filtered = filtered.Where( e =>
+            {
+                if ( dir.Length == 0 ) return true;
+                return e.Path.Equals( dir, StringComparison.OrdinalIgnoreCase )
+                    || e.Path.StartsWith( dirWithSlash, StringComparison.OrdinalIgnoreCase );
+            } );
+        }
+
+        if ( !string.IsNullOrWhiteSpace( kindFilter ) )
+        {
+            var k = kindFilter.Trim().ToLowerInvariant();
+            filtered = filtered.Where( e => string.Equals( e.Kind, k, StringComparison.OrdinalIgnoreCase ) );
+        }
+
+        var page = filtered.ToArray();
+        if ( count > 0 && count < page.Length )
+            page = page[..count];
+
+        var items = page.Select( e => new
+        {
+            path    = e.Path,
+            message = e.Message,
+            utc     = e.Utc.ToString( "yyyy-MM-ddTHH:mm:ss.fffZ" ),
+            kind    = e.Kind
+        } ).ToList();
+
+        return HandlerBase.Success( new
+        {
+            ok            = true,
+            total         = total,
+            cap           = _compileErrorsCap,
+            capturedAtUtc = capturedAt == DateTime.MinValue
+                              ? null
+                              : capturedAt.ToString( "yyyy-MM-ddTHH:mm:ss.fffZ" ),
+            count         = items.Count,
+            errors        = items
+        } );
     }
 
     // ── browse ────────────────────────────────────────────────────────────

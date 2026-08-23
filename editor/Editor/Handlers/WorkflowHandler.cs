@@ -60,7 +60,9 @@ internal static class WorkflowHandler
         if ( string.IsNullOrWhiteSpace( typeName ) )
             return HandlerBase.Error( "Missing required 'type_name' parameter.", "verify_networked_component" );
 
-        var reflection = ReflectionHandler.Handle( "get_type", BuildArgs( new { action = "get_type", name = typeName, section = "properties", include_inherited = true } ) );
+        // reflection migrated to the [McpTool] scan (mcp-dynamic-discovery Phase 3
+        // Wave 3.2) — call the [McpAction("get_type")] handler directly.
+        var reflection = ReflectionHandler.HandleGetType( BuildArgs( new { action = "get_type", name = typeName, section = "properties", include_inherited = true } ) );
         var compile = await PipelineHandler.HandleAsync( "compile_and_verify", BuildArgs( new { action = "compile_and_verify", skip_verify = true } ) );
         return HandlerBase.Success( new
         {

@@ -24,7 +24,7 @@
       "ReplacementDirectives": {
         ".Server.cs": "SERVER"
       },
-      "IgnoreFolders": [],
+      "IgnoreFolders": [ "Analyzers" ],
       "DistinctAssemblyReferences": []
     }
   }

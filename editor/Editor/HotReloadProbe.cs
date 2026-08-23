@@ -1,4 +1,6 @@
 using System;
+using System.Collections.Generic;
+using System.Diagnostics;
 using Editor;
 
 namespace Arenula;
@@ -35,8 +37,49 @@ internal static class HotReloadProbe
     private static int _lastWarningGeneration = -1;
     private static string _lastWarningToken;
 
+    // Per-generation snapshots for the editor.get_hotload_summary MCP tool.
+    // LinkedList because we trim from the head and append at the tail; List<>.RemoveAt(0)
+    // would be O(n) per hotload. Read from MCP handler thread, mutated only from the
+    // [EditorEvent.Hotload] handler — lock keeps enumeration safe.
+    private const int _resultsCap = 10;
+    internal const int RecentResultsCap = _resultsCap;
+    private static readonly LinkedList<HotloadResultSnapshot> _recentResults = new();
+    private static readonly object _recentResultsLock = new();
+
     internal static int Generation => _generation;
     internal static DateTime LastHotloadUtc => _lastHotloadUtc;
+
+    /// <summary>
+    /// Snapshot of a single hotload event. Built in <see cref="OnHotload"/> from the
+    /// log-scan output (Option B per the wave-2 reflection probe — engine offers no
+    /// public access path to the live <c>Sandbox.HotloadResult</c> instance).
+    /// </summary>
+    internal sealed record HotloadResultSnapshot(
+        int Generation,
+        DateTime Utc,
+        string Status,                      // "ok" | "warnings" | "errors"
+        IReadOnlyList<string> WarningTokens,
+        IReadOnlyList<string> FailedTypes,
+        double ScanWallMs,
+        int LogEntriesScanned );
+
+    /// <summary>
+    /// Snapshot accessor for the MCP <c>editor.get_hotload_summary</c> handler. Returns
+    /// a defensive copy so the JSON serializer can iterate without contention against
+    /// a concurrent <see cref="OnHotload"/> mutation. Newest entries last (LinkedList
+    /// append-at-tail order).
+    /// </summary>
+    internal static IReadOnlyList<HotloadResultSnapshot> RecentResults()
+    {
+        lock ( _recentResultsLock )
+        {
+            var arr = new HotloadResultSnapshot[_recentResults.Count];
+            int i = 0;
+            for ( var node = _recentResults.First; node != null; node = node.Next, i++ )
+                arr[i] = node.Value;
+            return arr;
+        }
+    }
 
     /// <summary>
     /// True if the hotload at <paramref name="generation"/> emitted a token indicating
@@ -66,12 +109,41 @@ internal static class HotReloadProbe
         // A short time window defends against off-by-one clock skew between the log
         // timestamps (logger thread) and DateTime.UtcNow here (main thread).
         var windowStart = _lastHotloadUtc - TimeSpan.FromSeconds( 5 );
-        var hit = ScanLogForUpgradeWarnings( windowStart );
-        if ( hit != null )
+
+        // Time the log scan so the per-generation snapshot can report wall time.
+        // Useful when /audit notices "current generation didn't advance" — we can
+        // see whether the scan itself stalled vs the engine never firing the event.
+        var sw = Stopwatch.StartNew();
+        var scan = BuildSnapshotScan( windowStart );
+        sw.Stop();
+
+        if ( scan.FirstHitToken != null )
         {
             _lastWarningGeneration = _generation;
-            _lastWarningToken = hit;
+            _lastWarningToken = scan.FirstHitToken;
         }
+
+        // Build + append the per-generation snapshot. Wrap in try/catch — a faulting
+        // snapshot must never break the [EditorEvent.Hotload] event chain (the
+        // existing warning-detector ScanLogForUpgradeWarnings has the same defense).
+        try
+        {
+            var status = scan.HasErrors ? "errors" : ( scan.HasWarnings ? "warnings" : "ok" );
+            var snap = new HotloadResultSnapshot(
+                Generation:        _generation,
+                Utc:               _lastHotloadUtc,
+                Status:            status,
+                WarningTokens:     scan.DistinctTokens,
+                FailedTypes:       scan.FailedTypes,
+                ScanWallMs:        sw.Elapsed.TotalMilliseconds,
+                LogEntriesScanned: scan.EntriesScanned );
+            lock ( _recentResultsLock )
+            {
+                _recentResults.AddLast( snap );
+                while ( _recentResults.Count > _resultsCap ) _recentResults.RemoveFirst();
+            }
+        }
+        catch { /* best-effort snapshot — never throw from [EditorEvent.Hotload] */ }
     }
 
     /// <summary>
@@ -96,35 +168,121 @@ internal static class HotReloadProbe
     /// </summary>
     private static string ScanLogForUpgradeWarnings( DateTime windowStart )
     {
+        // Back-compat shim — preserves the original short-circuit "first hit only"
+        // contract for callers (RescanForWarnings, pipeline). The richer per-snapshot
+        // scan is BuildSnapshotScan below.
+        return BuildSnapshotScan( windowStart ).FirstHitToken;
+    }
+
+    /// <summary>Result of a single log-scan over the post-hotload window. Contains
+    /// every signal the snapshot record needs: distinct hit tokens, parsed failed-type
+    /// names, error/warning aggregation, and how many log entries we walked.</summary>
+    private readonly struct ScanResult
+    {
+        public string FirstHitToken { get; init; }            // back-compat with ScanLogForUpgradeWarnings
+        public IReadOnlyList<string> DistinctTokens { get; init; }
+        public IReadOnlyList<string> FailedTypes { get; init; }
+        public bool HasErrors { get; init; }                  // [HOTLOAD_UPGRADE_FAILED] hit
+        public bool HasWarnings { get; init; }                // any warning-class token hit
+        public int EntriesScanned { get; init; }
+    }
+
+    private static ScanResult BuildSnapshotScan( DateTime windowStart )
+    {
+        var emptyStrings = Array.Empty<string>();
         try
         {
             var snap = Arenula.EditorHandler.LogSnapshot();
-            if ( snap == null || snap.Length == 0 ) return null;
+            if ( snap == null || snap.Length == 0 )
+                return new ScanResult { DistinctTokens = emptyStrings, FailedTypes = emptyStrings };
+
+            string firstHit = null;
+            var tokens = new List<string>( 4 );
+            var failedTypes = new List<string>( 4 );
+            bool hasErrors = false, hasWarnings = false;
+            int entriesScanned = 0;
 
             for ( int i = snap.Length - 1; i >= 0; i-- )
             {
                 var e = snap[i];
                 if ( e.Time < windowStart ) break;
+                entriesScanned++;
 
                 var m = e.Message ?? string.Empty;
-                // Explicit IHotloadManaged.Failed() signal from game-assembly user code.
-                // More reliable than engine log tokens because Failed() is called
-                // unconditionally when a live instance can't be migrated — the engine's
-                // own "couldn't upgrade" line is sometimes suppressed at hotload_log=0.
-                if ( m.Contains( HotReloadFailureTokens.UpgradeFailedPrefix, StringComparison.OrdinalIgnoreCase ) )
-                    return "IHotloadManaged.Failed";
-                if ( m.Contains( "couldn't upgrade", StringComparison.OrdinalIgnoreCase ) )
-                    return "couldn't upgrade";
-                if ( m.Contains( "InstanceUpgrader", StringComparison.OrdinalIgnoreCase ) )
-                    return "InstanceUpgrader";
-
                 var s = e.Stack ?? string.Empty;
-                if ( s.Contains( "InstanceUpgrader", StringComparison.OrdinalIgnoreCase ) )
-                    return "InstanceUpgrader";
+
+                // [HOTLOAD_UPGRADE_FAILED] — explicit IHotloadManaged.Failed() user-code signal.
+                if ( m.Contains( HotReloadFailureTokens.UpgradeFailedPrefix, StringComparison.OrdinalIgnoreCase ) )
+                {
+                    AddIfMissing( tokens, "IHotloadManaged.Failed" );
+                    hasErrors = true;
+                    firstHit ??= "IHotloadManaged.Failed";
+                    var t = ExtractTypeAfter( m, "type=" );
+                    if ( t != null ) AddIfMissing( failedTypes, t );
+                }
+
+                // "couldn't upgrade <Type>" — engine InstanceUpgrader warning.
+                int idx = m.IndexOf( "couldn't upgrade", StringComparison.OrdinalIgnoreCase );
+                if ( idx >= 0 )
+                {
+                    AddIfMissing( tokens, "couldn't upgrade" );
+                    hasWarnings = true;
+                    firstHit ??= "couldn't upgrade";
+                    // Token after "couldn't upgrade " (15-char prefix + space).
+                    var rest = m.Substring( idx + "couldn't upgrade".Length ).TrimStart();
+                    var t = ExtractFirstWord( rest );
+                    if ( t != null ) AddIfMissing( failedTypes, t );
+                }
+
+                // "InstanceUpgrader" in message or stack — generic exception trace fallback.
+                if ( m.Contains( "InstanceUpgrader", StringComparison.OrdinalIgnoreCase ) ||
+                     s.Contains( "InstanceUpgrader", StringComparison.OrdinalIgnoreCase ) )
+                {
+                    AddIfMissing( tokens, "InstanceUpgrader" );
+                    hasWarnings = true;
+                    firstHit ??= "InstanceUpgrader";
+                }
             }
+
+            return new ScanResult
+            {
+                FirstHitToken   = firstHit,
+                DistinctTokens  = tokens,
+                FailedTypes     = failedTypes,
+                HasErrors       = hasErrors,
+                HasWarnings     = hasWarnings,
+                EntriesScanned  = entriesScanned
+            };
         }
-        catch { /* best-effort diagnostic — never throw from a [EditorEvent.Hotload] handler */ }
-        return null;
+        catch
+        {
+            // best-effort diagnostic — never throw from a [EditorEvent.Hotload] handler
+            return new ScanResult { DistinctTokens = emptyStrings, FailedTypes = emptyStrings };
+        }
+    }
+
+    private static void AddIfMissing( List<string> list, string value )
+    {
+        for ( int i = 0; i < list.Count; i++ )
+            if ( string.Equals( list[i], value, StringComparison.OrdinalIgnoreCase ) ) return;
+        list.Add( value );
+    }
+
+    private static string ExtractTypeAfter( string message, string marker )
+    {
+        int idx = message.IndexOf( marker, StringComparison.OrdinalIgnoreCase );
+        if ( idx < 0 ) return null;
+        return ExtractFirstWord( message.Substring( idx + marker.Length ) );
+    }
+
+    private static string ExtractFirstWord( string s )
+    {
+        if ( string.IsNullOrEmpty( s ) ) return null;
+        int start = 0;
+        while ( start < s.Length && char.IsWhiteSpace( s[start] ) ) start++;
+        int end = start;
+        while ( end < s.Length && !char.IsWhiteSpace( s[end] ) && s[end] != ',' && s[end] != ';' ) end++;
+        return end > start ? s.Substring( start, end - start ) : null;
     }
 
     /// <summary>

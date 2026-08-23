@@ -18,14 +18,68 @@ internal static class OperationHandler
                 "preview"  => Preview( args ),
                 "apply"    => Apply( args ),
                 "rollback" => Rollback( args ),
+                // Control-plane actions normally enter via RpcDispatcher's
+                // coordinator-bypass fast path; this arm covers indirect routes
+                // (e.g. batch dispatch) where no McpSession is threaded.
+                "cancel" or "list" or "locks_held" => HandleControl( action, args, null ),
                 _ => HandlerBase.Error( $"Unknown action '{action}' for tool 'operation'.", action,
-                    "Valid actions: validate, preview, apply, rollback" )
+                    "Valid actions: validate, preview, apply, rollback, cancel, list, locks_held" )
             };
         }
         catch ( Exception ex )
         {
             return HandlerBase.Error( ex.Message, action );
         }
+    }
+
+    /// <summary>
+    /// Coordinator control plane (mcp-operation-lifecycle-hardening, audit
+    /// finding #3). Dispatched by RpcDispatcher BEFORE McpOperationCoordinator.
+    /// TryBegin — a wedged scene-wide lease blocks even ReadOnly ops in
+    /// FindConflict, so the cancel that exists to clear the wedge must never be
+    /// gated by it. These actions touch only MCP-internal thread-safe static
+    /// state: no scene access, no MainThread hop, no lease.
+    /// </summary>
+    internal static object HandleControl( string action, JsonElement args, McpSession session )
+    {
+        try
+        {
+            return action switch
+            {
+                "cancel"     => Cancel( args, session ),
+                "list"       => HandlerBase.Success( McpOperationCoordinator.Snapshot() ),
+                "locks_held" => HandlerBase.Success( GameObjectLockMap.LocksHeldSnapshot() ),
+                _ => HandlerBase.Error( $"Unknown control action '{action}' for tool 'operation'.", action,
+                    "Control actions: cancel, list, locks_held" )
+            };
+        }
+        catch ( Exception ex )
+        {
+            return HandlerBase.Error( ex.Message, action );
+        }
+    }
+
+    private static object Cancel( JsonElement args, McpSession session )
+    {
+        var operationId = HandlerBase.GetString( args, "operation_id" );
+        if ( string.IsNullOrWhiteSpace( operationId ) )
+            return HandlerBase.Error( "Missing required 'operation_id'.", "cancel",
+                "Get in-flight operation ids from operation.list, or from the rejected_operation_id / holder.operation_id fields of a gameobject_locked / mcp_busy error." );
+
+        var canceled = McpOperationCoordinator.CancelOperation( operationId, session?.AgentId );
+        if ( canceled is null )
+            return HandlerBase.Error( $"No active operation '{operationId}'.", "cancel",
+                "It may have completed, been canceled, or been zombie-swept already. operation.list shows current in-flight operations.",
+                McpOperationCoordinator.Snapshot() );
+
+        return HandlerBase.Success( new
+        {
+            canceled = true,
+            operation = canceled,
+            note = "Lease released — other agents are unblocked. The underlying handler task, if still "
+                 + "running, is detached and may still mutate editor state until it finishes; its eventual "
+                 + "lease release is a no-op. Cancel coordination bookkeeping, not handler execution."
+        } );
     }
 
     private static object Validate( JsonElement args )
@@ -75,7 +129,8 @@ internal static class OperationHandler
             return HandlerBase.Success( new { applied = false, errors } );
 
         var merged = BatchHandler.MergeActionAndParams( spec.Action, spec.Arguments );
-        var result = BatchHandler.DispatchToHandler( spec.Tool, spec.Action, merged );
+        // [HANDOFF-TRUST: engine-fork-phase3-1-library-mvp Phase 3 — operation.apply does not currently receive McpSession; passing null is safe because session.identify is not a valid target for operation.apply (which dispatches scene edits only). Phase 4 may thread McpSession through OperationHandler for full per-key Coordinator integration. No inherited handoff hypothesis applies.]
+        var result = BatchHandler.DispatchToHandler( spec.Tool, spec.Action, merged, null );
 
         return HandlerBase.Success( new
         {
