@@ -510,6 +510,10 @@ internal static class McpErrorCode
     internal const string TypeLibraryCorrupted = "TYPELIBRARY_CORRUPTED"; // InstanceUpgrader 'couldn't upgrade' — cold restart territory
     internal const string VerifyFailed      = "VERIFY_FAILED";        // a verification stage reported failures
 
+    // Runtime pawn readiness / ownership.
+    internal const string PawnNotReady      = "PAWN_NOT_READY";       // play began, but no active-scene pawn exists yet
+    internal const string PawnOwnerNotLocal = "PAWN_OWNER_NOT_LOCAL"; // active-scene controllers exist, none is locally controlled
+
     // Contention — transient by definition; re-issue the same call after a pause.
     internal const string LockedBy          = "LOCKED_BY";            // GameObject/file lock held by another agent
     internal const string OperationInProgress = "OPERATION_IN_PROGRESS"; // operation coordinator busy / mutex contention
@@ -525,7 +529,7 @@ internal static class McpErrorCode
 
     private static readonly HashSet<string> Retryable = new( StringComparer.Ordinal )
     {
-        LockedBy, OperationInProgress, CompileTimeout
+        LockedBy, OperationInProgress, CompileTimeout, PawnNotReady
     };
 
     /// <summary>True when blind re-issue of the same call is a sane next step (contention/timeout class).</summary>

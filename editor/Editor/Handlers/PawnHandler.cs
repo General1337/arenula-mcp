@@ -76,25 +76,157 @@ internal static class PawnHandler
 
 	// ── Resolution ───────────────────────────────────────────────────
 
-	private static PlayerController ResolveController( out string failReason )
+	internal readonly struct ControllerCandidateFacts
+	{
+		internal bool Valid { get; init; }
+		internal bool Enabled { get; init; }
+		internal bool InActiveScene { get; init; }
+		internal bool Networked { get; init; }
+		internal bool IsOwner { get; init; }
+		internal bool IsProxy { get; init; }
+	}
+
+	internal static int SelectControllerCandidate(
+		IReadOnlyList<ControllerCandidateFacts> candidates,
+		bool isPlaying,
+		out string selectionReason )
+	{
+		selectionReason = null;
+		int bestIndex = -1;
+		int bestRank = 0;
+
+		for ( int i = 0; i < candidates.Count; i++ )
+		{
+			var c = candidates[i];
+			if ( !c.Valid || !c.Enabled ) continue;
+			if ( isPlaying && !c.InActiveScene ) continue;
+
+			var localRank = c.IsOwner && !c.IsProxy ? 3
+				: c.Networked && !c.IsProxy ? 2
+				: !c.Networked && !c.IsProxy ? 1
+				: 0;
+			if ( isPlaying && localRank == 0 ) continue;
+
+			var rank = (c.InActiveScene ? 10 : 0) + localRank;
+			if ( rank <= bestRank ) continue;
+			bestRank = rank;
+			bestIndex = i;
+		}
+
+		if ( bestIndex >= 0 )
+		{
+			var selected = candidates[bestIndex];
+			selectionReason = selected.IsOwner ? "active_scene_network_owner"
+				: selected.Networked ? "active_scene_non_proxy"
+				: selected.InActiveScene ? "active_scene_local_unnetworked"
+				: "editor_fallback";
+		}
+
+		return bestIndex;
+	}
+
+	private static PlayerController ResolveController(
+		out string failReason,
+		out string errorCode,
+		out string selectionReason,
+		out int candidateCount )
 	{
 		failReason = null;
+		errorCode = null;
+		selectionReason = null;
 
 		var activeScene = Game.ActiveScene;
 		IEnumerable<Scene> scenes = Scene.All ?? Enumerable.Empty<Scene>();
 		if ( activeScene != null )
-			scenes = scenes.Concat( new[] { activeScene } );
-		scenes = scenes.Where( s => s != null ).Distinct();
+			scenes = new[] { activeScene }.Concat( scenes );
 
-		foreach ( var scene in scenes )
+		var controllers = scenes
+			.Where( s => s != null )
+			.Distinct()
+			.SelectMany( s => s.GetAllComponents<PlayerController>() )
+			.Where( c => c != null )
+			.Distinct()
+			.ToList();
+		candidateCount = controllers.Count;
+
+		var facts = controllers.Select( c => new ControllerCandidateFacts
 		{
-			var found = scene.GetAllComponents<PlayerController>().FirstOrDefault( c => c.IsValid() );
-			if ( found != null )
-				return found;
+			Valid = c.IsValid(),
+			Enabled = c.Enabled,
+			InActiveScene = activeScene != null && ReferenceEquals( c.Scene, activeScene ),
+			Networked = c.GameObject?.Network.Active == true,
+			IsOwner = c.GameObject?.Network.IsOwner == true,
+			IsProxy = c.IsProxy
+		} ).ToList();
+
+		var selectedIndex = SelectControllerCandidate( facts, Game.IsPlaying, out selectionReason );
+		if ( selectedIndex >= 0 ) return controllers[selectedIndex];
+
+		if ( Game.IsPlaying && controllers.Any( c => ReferenceEquals( c.Scene, activeScene ) ) )
+		{
+			errorCode = McpErrorCode.PawnOwnerNotLocal;
+			failReason = "The play scene has PlayerController candidates, but none is locally controlled. "
+				+ "Wait for the local network owner to become active; if this persists, inspect owner/proxy state.";
+			return null;
 		}
 
-		failReason = "No active PlayerController found in any scene. Start play mode (or check that the player spawned).";
+		if ( Game.IsPlaying )
+		{
+			errorCode = McpErrorCode.PawnNotReady;
+			failReason = "The play scene has no local PlayerController yet. It may still be initializing, "
+				+ "or a team/deployment game mode may be intentionally waiting for player selection.";
+			return null;
+		}
+
+		failReason = "No enabled PlayerController found. Start play mode (or check that the player spawned).";
+		errorCode = McpErrorCode.NotFound;
 		return null;
+	}
+
+	internal static object GetReadinessSnapshot()
+	{
+		var controller = ResolveController(
+			out var reason, out var errorCode, out var selectionReason, out var candidateCount );
+		if ( controller != null )
+		{
+			return new
+			{
+				status = Game.IsPlaying ? "pawn_ready" : "editor_fallback",
+				ready = Game.IsPlaying,
+				controller_id = controller.Id.ToString(),
+				controller_name = controller.GameObject?.Name,
+				selection_reason = selectionReason,
+				candidate_count = candidateCount,
+				selected_scene = controller.Scene?.Name
+			};
+		}
+
+		return new
+		{
+			status = errorCode == McpErrorCode.PawnOwnerNotLocal
+				? "owner_not_local"
+				: Game.IsPlaying ? "initializing_or_team_lobby" : "not_playing",
+			ready = false,
+			error_code = errorCode,
+			retryable = McpErrorCode.IsRetryable( errorCode ),
+			reason,
+			candidate_count = candidateCount,
+			selected_scene = Game.ActiveScene?.Name
+		};
+	}
+
+	private static object ControllerUnavailable(
+		string action, string reason, string errorCode, int candidateCount )
+	{
+		var suggestion = errorCode == McpErrorCode.PawnOwnerNotLocal
+			? "Inspect the play-scene pawn owner/proxy state; do not control a proxy or editor template."
+			: "Retry after play initialization, or complete the active team/deployment selection if the mode intentionally defers spawning.";
+		return HandlerBase.Error( reason, action, suggestion, new
+		{
+			candidate_count = candidateCount,
+			active_scene = Game.ActiveScene?.Name,
+			is_playing = Game.IsPlaying
+		}, errorCode );
 	}
 
 	// ── Actions ──────────────────────────────────────────────────────
@@ -116,9 +248,9 @@ internal static class PawnHandler
 		var anglesStr = HandlerBase.GetString( args, "eye_angles" );
 		var preserveVelocity = HandlerBase.GetBool( args, "preserve_velocity", false );
 
-		var controller = ResolveController( out var reason );
+		var controller = ResolveController( out var reason, out var errorCode, out var selectionReason, out var candidateCount );
 		if ( controller == null )
-			return HandlerBase.Error( reason, "teleport" );
+			return ControllerUnavailable( "teleport", reason, errorCode, candidateCount );
 
 		var prevPos = controller.WorldPosition;
 		var prevVel = controller.Velocity;
@@ -160,7 +292,10 @@ internal static class PawnHandler
 			preserve_velocity = preserveVelocity,
 			velocity_reset_applied = velocityResetApplied,
 			previous_velocity = HandlerBase.V3( prevVel ),
-			controller_id = controller.Id.ToString()
+			controller_id = controller.Id.ToString(),
+			selection_reason = selectionReason,
+			candidate_count = candidateCount,
+			selected_scene = controller.Scene?.Name
 		} );
 	}
 
@@ -178,9 +313,9 @@ internal static class PawnHandler
 				"Format: 'x,y,z' (floats, comma-separated)." );
 		}
 
-		var controller = ResolveController( out var reason );
+		var controller = ResolveController( out var reason, out var errorCode, out var selectionReason, out var candidateCount );
 		if ( controller == null )
-			return HandlerBase.Error( reason, "set_velocity" );
+			return ControllerUnavailable( "set_velocity", reason, errorCode, candidateCount );
 
 		// [HANDOFF-TRUST: PlayerController.Velocity is read-only; route through controller.Body (Rigidbody) for the settable side. Same CS0200 fix as Teleport above.]
 		if ( !controller.Body.IsValid() )
@@ -197,15 +332,18 @@ internal static class PawnHandler
 			to = HandlerBase.V3( controller.Body.Velocity ),
 			previous_computed_velocity = HandlerBase.V3( prev ),
 			note = "Sets Rigidbody.Velocity directly. PlayerController.Velocity is computed (Body.Velocity - GroundVelocity), so the post-state controller.Velocity may differ if the player is standing on moving geometry.",
-			controller_id = controller.Id.ToString()
+			controller_id = controller.Id.ToString(),
+			selection_reason = selectionReason,
+			candidate_count = candidateCount,
+			selected_scene = controller.Scene?.Name
 		} );
 	}
 
 	private static object GetState( JsonElement args )
 	{
-		var controller = ResolveController( out var reason );
+		var controller = ResolveController( out var reason, out var errorCode, out var selectionReason, out var candidateCount );
 		if ( controller == null )
-			return HandlerBase.Error( reason, "get_state" );
+			return ControllerUnavailable( "get_state", reason, errorCode, candidateCount );
 
 		var modeName = controller.Mode?.GetType().Name ?? "<none>";
 		var groundId = controller.GroundObject?.Id.ToString();
@@ -217,6 +355,9 @@ internal static class PawnHandler
 			action = "get_state",
 			controller_id = controller.Id.ToString(),
 			controller_name = controller.GameObject?.Name,
+			selection_reason = selectionReason,
+			candidate_count = candidateCount,
+			selected_scene = controller.Scene?.Name,
 			pos = HandlerBase.V3( controller.WorldPosition ),
 			eye_position = HandlerBase.V3( controller.EyePosition ),
 			eye_angles = new

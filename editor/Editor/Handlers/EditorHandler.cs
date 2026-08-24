@@ -369,7 +369,12 @@ internal static class EditorHandler
     {
         var session = SceneEditorSession.Active;
         if ( session == null ) return HandlerBase.Error( "No editor session.", "start_play" );
-        if ( session.IsPlaying ) return HandlerBase.Confirm( "Already playing." );
+        if ( session.IsPlaying ) return HandlerBase.Success( new
+        {
+            message = "Already playing.",
+            play_state = "playing",
+            pawn_readiness = PawnHandler.GetReadinessSnapshot()
+        } );
         // Use EditorScene.Play (the canonical toolbar handler) instead of the low-level
         // session.SetPlaying. Play() clones the scene via CreateSceneFile → new Scene →
         // Load, fires "scene.startplay"/"scene.play" EditorEvents (widget binding
@@ -378,7 +383,14 @@ internal static class EditorHandler
         // GameEditorSession.Destroy → base.Destroy → Scene?.Destroy destroys the
         // editor's own scene. Ref: engine/Sandbox.Tools/Scene/EditorScene.cs Play().
         EditorScene.Play( session );
-        return HandlerBase.Confirm( "Play mode started." );
+        var playState = session.IsPlaying ? "playing" : "stopped";
+        return HandlerBase.Success( new
+        {
+            message = "Play mode started.",
+            play_state = playState,
+            pawn_readiness = PawnHandler.GetReadinessSnapshot(),
+            readiness_note = "Play startup is asynchronous. If pawn_readiness is not ready, retry pawn.get_state after initialization or complete team/deployment selection."
+        } );
     }
 
     // ── stop_play ────────────────────────────────────────────────────────
