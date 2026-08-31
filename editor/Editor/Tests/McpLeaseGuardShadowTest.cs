@@ -70,21 +70,21 @@ public static class McpLeaseGuardShadowTest
 		var requestId = Guid.NewGuid().ToString();
 		var direct = McpLeaseGuard.BindOuterLeaseSnapshot(
 			"agent-a", "scene.save", requestId, "agent-a", "scene_edit",
-			"scene.save", "boot-a", 1234 );
+			"scene.save", "boot-a", "", 0, 0, 1234 );
 		Check( "terminal-binding-direct-exact",
 			!selfTest && direct.IsValid,
 			selfTest, ref pass, ref fail );
 
 		var parent = McpLeaseGuard.BindOuterLeaseSnapshot(
 			"agent-a", "scene.save", requestId, "agent-a", "session",
-			"skill.sandboxpp-playtest", "boot-a", 1234 );
+			"skill.sandboxpp-playtest", "boot-a", "", 0, 0, 1234 );
 		Check( "terminal-binding-session-parent-rejected",
 			!selfTest && !parent.IsValid,
 			selfTest, ref pass, ref fail );
 
 		var mismatched = McpLeaseGuard.BindOuterLeaseSnapshot(
 			"agent-a", "scene.save", requestId, "agent-a", "scene_edit",
-			"scene.load", "boot-a", 1234 );
+			"scene.load", "boot-a", "", 0, 0, 1234 );
 		Check( "terminal-binding-operation-mismatch-rejected",
 			!selfTest && !mismatched.IsValid,
 			selfTest, ref pass, ref fail );
