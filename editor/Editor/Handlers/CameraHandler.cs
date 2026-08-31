@@ -10,6 +10,7 @@ namespace Arenula;
 
 /// <summary>
 /// camera tool: create, configure, capture_viewport, capture_tour, orbit_capture.
+/// Ported from CameraToolHandlers.cs, extended with capture actions.
 /// </summary>
 internal static class CameraHandler
 {
@@ -35,10 +36,13 @@ internal static class CameraHandler
     }
 
     // ── create ────────────────────────────────────────────────────────
+    // Ported from CameraToolHandlers.CreateCamera
 
     private static object Create( JsonElement args )
     {
-        var scene = HandlerBase.RequireScene( "create" );
+        var scene = SceneHelpers.ResolveScene();
+        if ( scene == null )
+            return HandlerBase.Error( "No active scene.", "create" );
 
         var posStr = HandlerBase.GetString( args, "position" );
         var position = posStr != null ? HandlerBase.ParseVector3( posStr ) : new Vector3( 0, 100, 0 );
@@ -50,25 +54,34 @@ internal static class CameraHandler
                              HandlerBase.ParseVector3( rotStr ).z )
             : Rotation.From( -90, 0, 0 );
 
-        var go = SceneHelpers.CreateChildObject( scene, args, "Camera", position, rotation );
+        var go = scene.CreateObject();
+        go.Name = HandlerBase.GetString( args, "name" ) ?? "Camera";
+        go.WorldPosition = position;
+        go.WorldRotation = rotation;
 
         var cam = go.Components.Create<CameraComponent>();
-        if ( HandlerBase.TryGetFloat( args, "fov", out var fov ) ) cam.FieldOfView = fov;
+        if ( args.TryGetProperty( "fov", out var fovEl ) && fovEl.ValueKind == JsonValueKind.Number )
+            cam.FieldOfView = fovEl.GetSingle();
         else
             cam.FieldOfView = 60f;
 
-        if ( HandlerBase.TryGetFloat( args, "near_clip", out var zn ) ) cam.ZNear = zn;
+        if ( args.TryGetProperty( "near_clip", out var znEl ) && znEl.ValueKind == JsonValueKind.Number )
+            cam.ZNear = znEl.GetSingle();
         else
             cam.ZNear = 10f;
 
-        if ( HandlerBase.TryGetFloat( args, "far_clip", out var zf ) ) cam.ZFar = zf;
+        if ( args.TryGetProperty( "far_clip", out var zfEl ) && zfEl.ValueKind == JsonValueKind.Number )
+            cam.ZFar = zfEl.GetSingle();
         else
             cam.ZFar = 10000f;
 
         cam.IsMainCamera = HandlerBase.GetBool( args, "is_main_camera", true );
 
-        if ( HandlerBase.TryGetBool( args, "orthographic", out var ortho ) ) cam.Orthographic = ortho;
-        if ( HandlerBase.TryGetFloat( args, "orthographic_height", out var oh ) ) cam.OrthographicHeight = oh;
+        if ( args.TryGetProperty( "orthographic", out var orthoEl ) &&
+             ( orthoEl.ValueKind == JsonValueKind.True || orthoEl.ValueKind == JsonValueKind.False ) )
+            cam.Orthographic = orthoEl.GetBoolean();
+        if ( args.TryGetProperty( "orthographic_height", out var ohEl ) && ohEl.ValueKind == JsonValueKind.Number )
+            cam.OrthographicHeight = ohEl.GetSingle();
 
         return HandlerBase.Success( new
         {
@@ -84,7 +97,9 @@ internal static class CameraHandler
 
     private static object CaptureViewport( JsonElement args )
     {
-        var scene = HandlerBase.RequireScene( "capture_viewport" );
+        var scene = SceneHelpers.ResolveScene();
+        if ( scene == null )
+            return HandlerBase.Error( "No active scene.", "capture_viewport" );
 
         var width = HandlerBase.GetInt( args, "width", 1280 );
         var height = HandlerBase.GetInt( args, "height", 720 );
@@ -168,10 +183,13 @@ internal static class CameraHandler
     }
 
     // ── configure ─────────────────────────────────────────────────────
+    // Ported from CameraToolHandlers.ConfigureCamera
 
     private static object Configure( JsonElement args )
     {
-        var scene = HandlerBase.RequireScene( "configure" );
+        var scene = SceneHelpers.ResolveScene();
+        if ( scene == null )
+            return HandlerBase.Error( "No active scene.", "configure" );
 
         var id = HandlerBase.GetString( args, "id" );
         if ( string.IsNullOrEmpty( id ) )
@@ -182,14 +200,27 @@ internal static class CameraHandler
         if ( cam == null )
             return HandlerBase.Error( $"No CameraComponent found on '{go.Name}'.", "configure" );
 
-        if ( HandlerBase.TryGetFloat( args, "fov", out var fov ) ) cam.FieldOfView = fov;
-        if ( HandlerBase.TryGetFloat( args, "near_clip", out var zn ) ) cam.ZNear = zn;
-        if ( HandlerBase.TryGetFloat( args, "far_clip", out var zf ) ) cam.ZFar = zf;
-        if ( HandlerBase.TryGetBool( args, "is_main_camera", out var mc ) ) cam.IsMainCamera = mc;
-        if ( HandlerBase.TryGetBool( args, "orthographic", out var ortho ) ) cam.Orthographic = ortho;
-        if ( HandlerBase.TryGetFloat( args, "orthographic_height", out var oh ) ) cam.OrthographicHeight = oh;
-        HandlerBase.ApplyColor( args, "background_color", c => cam.BackgroundColor = c );
-        if ( HandlerBase.TryGetInt( args, "priority", out var pr ) ) cam.Priority = pr;
+        if ( args.TryGetProperty( "fov", out var fovEl ) && fovEl.ValueKind == JsonValueKind.Number )
+            cam.FieldOfView = fovEl.GetSingle();
+        if ( args.TryGetProperty( "near_clip", out var znEl ) && znEl.ValueKind == JsonValueKind.Number )
+            cam.ZNear = znEl.GetSingle();
+        if ( args.TryGetProperty( "far_clip", out var zfEl ) && zfEl.ValueKind == JsonValueKind.Number )
+            cam.ZFar = zfEl.GetSingle();
+        if ( args.TryGetProperty( "is_main_camera", out var mcEl ) &&
+             ( mcEl.ValueKind == JsonValueKind.True || mcEl.ValueKind == JsonValueKind.False ) )
+            cam.IsMainCamera = mcEl.GetBoolean();
+        if ( args.TryGetProperty( "orthographic", out var orthoEl ) &&
+             ( orthoEl.ValueKind == JsonValueKind.True || orthoEl.ValueKind == JsonValueKind.False ) )
+            cam.Orthographic = orthoEl.GetBoolean();
+        if ( args.TryGetProperty( "orthographic_height", out var ohEl ) && ohEl.ValueKind == JsonValueKind.Number )
+            cam.OrthographicHeight = ohEl.GetSingle();
+        var bgStr = HandlerBase.GetString( args, "background_color" );
+        if ( !string.IsNullOrEmpty( bgStr ) )
+        {
+            try { cam.BackgroundColor = Color.Parse( bgStr ) ?? default; } catch { }
+        }
+        if ( args.TryGetProperty( "priority", out var prEl ) && prEl.ValueKind == JsonValueKind.Number )
+            cam.Priority = prEl.GetInt32();
 
         return HandlerBase.Confirm( $"Configured CameraComponent on '{go.Name}'." );
     }
@@ -200,7 +231,9 @@ internal static class CameraHandler
 
     private static object CaptureTour( JsonElement args )
     {
-        var scene = HandlerBase.RequireScene( "capture_tour" );
+        var scene = SceneHelpers.ResolveScene();
+        if ( scene == null )
+            return HandlerBase.Error( "No active scene.", "capture_tour" );
 
         if ( !args.TryGetProperty( "shots", out var shotsEl ) || shotsEl.ValueKind != JsonValueKind.Array )
             return HandlerBase.Error( "Parameter 'shots' is required — array of {position, look_at, label?}.", "capture_tour" );
@@ -214,7 +247,10 @@ internal static class CameraHandler
         if ( camComp == null )
             return HandlerBase.Error( "No CameraComponent found in scene.", "capture_tour" );
 
-        var pixmap  = new Pixmap( width, height );
+        // 2026-04-23 — Sandbox.Pixmap does not implement IDisposable (only
+        // Bitmap does). Prior `using var` pattern was a compile error after
+        // engine update. Plain local; GC handles cleanup.
+        var pixmap = new Pixmap( width, height );
         var content = new List<object>();
         var fired   = 0;
         var errors  = new List<string>();
@@ -268,7 +304,9 @@ internal static class CameraHandler
 
     private static object OrbitCapture( JsonElement args )
     {
-        var scene = HandlerBase.RequireScene( "orbit_capture" );
+        var scene = SceneHelpers.ResolveScene();
+        if ( scene == null )
+            return HandlerBase.Error( "No active scene.", "orbit_capture" );
 
         var targetStr = HandlerBase.GetString( args, "target" );
         if ( string.IsNullOrEmpty( targetStr ) )
@@ -291,7 +329,9 @@ internal static class CameraHandler
         if ( camComp == null )
             return HandlerBase.Error( "No CameraComponent found in scene.", "orbit_capture" );
 
-        var pixmap  = new Pixmap( width, height );
+        // 2026-04-23 — Sandbox.Pixmap is not IDisposable; prior `using` was a
+        // compile error after engine update. Plain local; GC handles cleanup.
+        var pixmap = new Pixmap( width, height );
         var content = new List<object>();
         var rendered = 0;
 
@@ -355,20 +395,29 @@ internal static class CameraHandler
         var origRot = go.WorldRotation;
         var origFov = camComp.FieldOfView;
 
-        go.WorldPosition = pos;
+        // 2026-04-21 — try-finally around the mutation block so a throw
+        // inside RenderToPixmap (or the math) doesn't leave the editor
+        // camera parked at the shot position with the wrong FoV.
+        bool ok;
+        try
+        {
+            go.WorldPosition = pos;
 
-        var dir    = lookAt - pos;
-        var horiz  = new Vector2( dir.x, dir.y );
-        var yaw    = MathF.Atan2( horiz.y, horiz.x ) * ( 180f / MathF.PI );
-        var pitch  = MathF.Atan2( -dir.z, horiz.Length ) * ( 180f / MathF.PI );
-        go.WorldRotation   = Rotation.From( pitch, yaw, 0f );
-        camComp.FieldOfView = fov;
+            var dir    = lookAt - pos;
+            var horiz  = new Vector2( dir.x, dir.y );
+            var yaw    = MathF.Atan2( horiz.y, horiz.x ) * ( 180f / MathF.PI );
+            var pitch  = MathF.Atan2( -dir.z, horiz.Length ) * ( 180f / MathF.PI );
+            go.WorldRotation   = Rotation.From( pitch, yaw, 0f );
+            camComp.FieldOfView = fov;
 
-        var ok = camComp.RenderToPixmap( pixmap );
-
-        go.WorldPosition   = origPos;
-        go.WorldRotation   = origRot;
-        camComp.FieldOfView = origFov;
+            ok = camComp.RenderToPixmap( pixmap );
+        }
+        finally
+        {
+            go.WorldPosition   = origPos;
+            go.WorldRotation   = origRot;
+            camComp.FieldOfView = origFov;
+        }
 
         if ( !ok ) return ( null, "RenderToPixmap failed" );
         var bytes = pixmap.GetJpeg( quality );

@@ -11,6 +11,9 @@ namespace Arenula;
 /// <summary>
 /// prefab tool: instantiate, get_structure, get_instances, break, update,
 /// create, save_overrides, revert, get_overrides.
+/// Ported from Ozmium OzmiumWriteHandlers.InstantiatePrefab, OzmiumAssetHandlers.GetPrefabStructure,
+/// SceneToolHandlers.GetPrefabInstances, OzmiumEditorHandlers.BreakFromPrefab/UpdateFromPrefab.
+/// New actions: create, save_overrides, revert, get_overrides.
 /// </summary>
 internal static class PrefabHandler
 {
@@ -40,13 +43,14 @@ internal static class PrefabHandler
     }
 
     // ── instantiate ─────────────────────────────────────────────────────
+    // Ported from OzmiumWriteHandlers.InstantiatePrefab
 
     private static object Instantiate( JsonElement args )
     {
         var scene = SceneHelpers.ResolveScene();
         if ( scene == null ) return HandlerBase.Error( "No active scene.", "instantiate" );
 
-        var path = HandlerBase.GetAssetPath( args );
+        var path = SceneHelpers.NormalizePath( HandlerBase.GetString( args, "path" ) );
         if ( string.IsNullOrEmpty( path ) )
             return HandlerBase.Error( "Missing required 'path' parameter.", "instantiate" );
 
@@ -96,10 +100,11 @@ internal static class PrefabHandler
     }
 
     // ── get_structure ────────────────────────────────────────────────────
+    // Ported from OzmiumAssetHandlers.GetPrefabStructure
 
     private static object GetStructure( JsonElement args )
     {
-        var path = HandlerBase.GetAssetPath( args );
+        var path = SceneHelpers.NormalizePath( HandlerBase.GetString( args, "path" ) );
         if ( string.IsNullOrEmpty( path ) )
             return HandlerBase.Error( "Missing required 'path' parameter.", "get_structure" );
 
@@ -120,6 +125,7 @@ internal static class PrefabHandler
     }
 
     // ── get_instances ────────────────────────────────────────────────────
+    // Ported from SceneToolHandlers.GetPrefabInstances
 
     private static object GetInstances( JsonElement args )
     {
@@ -167,6 +173,7 @@ internal static class PrefabHandler
     }
 
     // ── break ────────────────────────────────────────────────────────────
+    // Ported from OzmiumEditorHandlers.BreakFromPrefab
 
     private static object Break( JsonElement args )
     {
@@ -183,6 +190,7 @@ internal static class PrefabHandler
     }
 
     // ── update ────────────────────────────────────────────────────────────
+    // Ported from OzmiumEditorHandlers.UpdateFromPrefab
 
     private static object Update( JsonElement args )
     {
@@ -218,8 +226,6 @@ internal static class PrefabHandler
         if ( string.IsNullOrEmpty( savePath ) )
             return HandlerBase.Error( "Missing required 'save_path' parameter.", "create" );
 
-        HandlerBase.RequireAssetsPath( savePath, "save_as_prefab" );
-
         var go = SceneHelpers.FindByIdOrThrow( scene, id, "create" );
 
         // Ensure the path ends with .prefab
@@ -246,8 +252,14 @@ internal static class PrefabHandler
             };
             System.IO.File.WriteAllText( absPath, prefabJson.ToJsonString() );
 
-            // Register the new file with the asset system
-            AssetSystem.RegisterFile( absPath );
+            // 2026-04-21 — do NOT call AssetSystem.RegisterFile(absPath).
+            // See AssetManageHandler.Create for rationale — eager registration
+            // contributes to stale entries in the Facepunch asset cache (no
+            // UnregisterFile exists) and fuels the per-frame
+            // 'Editor.LocalAssetLocations tool.frame' error spam.
+            // Engine rescan picks up the prefab; MCP clients that need to
+            // instantiate immediately can call prefab.instantiate which has
+            // its own fallback path for not-yet-indexed files.
 
             return HandlerBase.Success( new
             {

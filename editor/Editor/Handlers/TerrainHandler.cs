@@ -22,39 +22,32 @@ internal static class TerrainHandler
         if ( scene == null )
             return HandlerBase.Error( "No active scene found.", action, "Open a scene in the editor first." );
 
-        try
+        return action switch
         {
-            return action switch
-            {
-                "create"            => Create( scene, args ),
-                "configure"         => Configure( scene, args ),
-                "get_info"          => GetInfo( scene, args ),
-                "get_height"        => GetHeight( scene, args ),
-                "get_height_region" => GetHeightRegion( scene, args ),
-                "set_height"        => SetHeight( scene, args ),
-                "noise"             => ApplyNoise( scene, args ),
-                "erode"             => Erode( scene, args ),
-                "stamp"             => Stamp( scene, args ),
-                "add_material"      => AddMaterial( scene, args ),
-                "remove_material"   => RemoveMaterial( scene, args ),
-                "get_material_at"   => GetMaterialAt( scene, args ),
-                "blend_materials"   => BlendMaterials( scene, args ),
-                "set_hole"          => SetHole( scene, args ),
-                "paint_material"    => PaintMaterial( scene, args ),
-                "import_heightmap"  => ImportHeightmap( scene, args ),
-                "export_heightmap"  => ExportHeightmap( scene, args ),
-                "sync"              => Sync( scene, args ),
-                "configure_clutter" => ConfigureClutter( scene, args ),
-                "regenerate_clutter" => RegenerateClutter( scene, args ),
-                "clear_clutter"     => ClearClutter( scene, args ),
-                _                   => HandlerBase.Error( $"Unknown action '{action}' for tool 'terrain'.", action,
-                    "Valid actions: create, configure, get_info, get_height, get_height_region, set_height, noise, erode, stamp, add_material, remove_material, get_material_at, blend_materials, set_hole, paint_material, import_heightmap, export_heightmap, sync, configure_clutter, regenerate_clutter, clear_clutter" )
-            };
-        }
-        catch ( Exception ex )
-        {
-            return HandlerBase.Error( ex.Message, action );
-        }
+            "create"            => Create( scene, args ),
+            "configure"         => Configure( scene, args ),
+            "get_info"          => GetInfo( scene, args ),
+            "get_height"        => GetHeight( scene, args ),
+            "get_height_region" => GetHeightRegion( scene, args ),
+            "set_height"        => SetHeight( scene, args ),
+            "noise"             => ApplyNoise( scene, args ),
+            "erode"             => Erode( scene, args ),
+            "stamp"             => Stamp( scene, args ),
+            "add_material"      => AddMaterial( scene, args ),
+            "remove_material"   => RemoveMaterial( scene, args ),
+            "get_material_at"   => GetMaterialAt( scene, args ),
+            "blend_materials"   => BlendMaterials( scene, args ),
+            "set_hole"          => SetHole( scene, args ),
+            "paint_material"    => PaintMaterial( scene, args ),
+            "import_heightmap"  => ImportHeightmap( scene, args ),
+            "export_heightmap"  => ExportHeightmap( scene, args ),
+            "sync"              => Sync( scene, args ),
+            "configure_clutter"  => ConfigureClutter( scene, args ),
+            "regenerate_clutter" => RegenerateClutter( scene, args ),
+            "clear_clutter"      => ClearClutter( scene, args ),
+            _                   => HandlerBase.Error( $"Unknown action '{action}' for tool 'terrain'.", action,
+                "Valid actions: create, configure, get_info, get_height, get_height_region, set_height, noise, erode, stamp, add_material, remove_material, get_material_at, blend_materials, set_hole, paint_material, import_heightmap, export_heightmap, sync, configure_clutter, regenerate_clutter, clear_clutter" )
+        };
     }
 
     // ── create ───────────────────────────────────────────────────────────
@@ -111,9 +104,6 @@ internal static class TerrainHandler
         }
         terrain.TerrainSize = size;
         terrain.TerrainHeight = height;
-
-        // Initialize terrain rendering from storage
-        terrain.Create();
 
         return HandlerBase.Success( new
         {
@@ -826,9 +816,15 @@ internal static class TerrainHandler
             var res = storage.Resolution;
             var terrainHeight = terrain.TerrainHeight;
 
-            // Resize if image doesn't match terrain resolution
+            // 2026-04-21 — Resize allocates a new Bitmap; dispose the original
+            // before overwriting the reference to avoid leaking the pre-resize
+            // buffer (Bitmap is IDisposable).
             if ( bitmap.Width != res || bitmap.Height != res )
-                bitmap = bitmap.Resize( res, res );
+            {
+                var resized = bitmap.Resize( res, res );
+                bitmap.Dispose();
+                bitmap = resized;
+            }
 
             var pixels = bitmap.GetPixels();
             for ( int i = 0; i < Math.Min( pixels.Length, storage.HeightMap.Length ); i++ )
@@ -886,7 +882,14 @@ internal static class TerrainHandler
             var pngData = bitmap.ToPng();
             bitmap.Dispose();
 
-            var absPath = HandlerBase.ResolveProjectPath( path ) ?? path;
+            // 2026-04-21 — must resolve through project root; do NOT fall back
+            // to raw `path` (which would allow an external RPC client to write
+            // via absolute or `..`-containing paths to arbitrary locations on
+            // the user's disk).
+            var absPath = HandlerBase.ResolveProjectPath( path );
+            if ( string.IsNullOrEmpty( absPath ) )
+                return HandlerBase.Error( $"Path '{path}' could not be resolved inside the project root.", "export_heightmap",
+                    "Use a project-relative path like 'heightmaps/terrain_export.png'." );
             var dir = System.IO.Path.GetDirectoryName( absPath );
             if ( !string.IsNullOrEmpty( dir ) && !System.IO.Directory.Exists( dir ) )
                 System.IO.Directory.CreateDirectory( dir );
@@ -1213,7 +1216,12 @@ internal static class TerrainHandler
         // Convert to texel coordinates
         var texelX = (int)(localX * res);
         var texelY = (int)(localY * res);
-        var texelRadius = (int)(radius / terrainSize * res);
+        // 2026-04-21 — Math.Max(1, ...) mirrors BlendMaterials; without it,
+        // small radii silently round to 0 and the brush loop never executes.
+        var texelRadius = Math.Max( 1, (int)(radius / terrainSize * res) );
+
+        if ( materialIndex > 31 )
+            return HandlerBase.Error( $"Material index {materialIndex} exceeds 5-bit encoding (max 31).", "paint_material" );
 
         var painted = 0;
         for ( int dy = -texelRadius; dy <= texelRadius; dy++ )
@@ -1230,9 +1238,15 @@ internal static class TerrainHandler
                 var idx = py * res + px;
                 if ( idx >= 0 && idx < storage.ControlMap.Length )
                 {
-                    // Set the material index in the control map
-                    // Control map encoding: base material in lower bits
-                    storage.ControlMap[idx] = (uint)materialIndex;
+                    // 2026-04-21 — control map is a packed uint (bits 0-4 = base
+                    // material, 5-9 = overlay, 10-17 = blend, 31 = hole flag).
+                    // Solid-paint semantics: set base, clear overlay+blend,
+                    // preserve hole bit. Prior impl wrote raw `materialIndex`
+                    // and silently wiped the hole flag — breaking carved
+                    // terrain every time a user painted over a hole texel.
+                    uint packed = ( (uint)materialIndex & 0x1Fu )
+                                | ( storage.ControlMap[idx] & 0x80000000u );
+                    storage.ControlMap[idx] = packed;
                     painted++;
                 }
             }
@@ -1297,15 +1311,13 @@ internal static class TerrainHandler
     /// Persist TerrainStorage as a file-backed .terrain asset so the scene serializes
     /// a real resource reference instead of null.
     ///
-    /// The source .terrain JSON is written to the project directory (terrain_data/)
-    /// using an ABSOLUTE path resolved via HandlerBase.ResolveProjectPath. The file is
-    /// then handed to AssetSystem.RegisterFile( absPath ), which indexes it and compiles
-    /// it on demand — the same pattern AssetManageHandler uses. We must never pass a
-    /// bare relative path (e.g. "terrain_data/foo.terrain") to the asset compiler: the
-    /// native side resolves relative paths against the engine's process CWD
-    /// (…\sbox\), not the project root, which fails with "Could not find file" and
-    /// throws a NullReference inside the compiler. RegisterFile may return null when the
-    /// path collides with an already-mounted entry, so we fall back to FindByPath.
+    /// The source .terrain JSON is written to the project directory (terrain_data/).
+    /// The compiled .terrain_c is cached in sbox/core/terrain_data/ — this is a
+    /// limitation of AssetSystem.CompileResource which always resolves relative paths
+    /// against the engine's core mount. RegisterFile(absPath) returns null because the
+    /// asset path collides with the existing core-mounted entry, so we fall back to
+    /// FindByPath. A sync call regenerates the compiled cache if it's ever lost
+    /// (e.g. after an engine update).
     /// </summary>
     private static bool TryPersistStorageAsFile( Terrain terrain )
     {
@@ -1317,39 +1329,29 @@ internal static class TerrainHandler
             var name = terrain.GameObject.Name?.ToLower().Replace( ' ', '_' ) ?? "terrain";
             var relativePath = $"terrain_data/{name}.terrain";
             var absPath = HandlerBase.ResolveProjectPath( relativePath );
-            if ( absPath == null )
-            {
-                Log.Warning( "[terrain] Could not resolve project root — terrain storage not persisted." );
-                return false;
-            }
+            if ( absPath == null ) return false;
 
             var dir = System.IO.Path.GetDirectoryName( absPath );
             if ( !string.IsNullOrEmpty( dir ) && !System.IO.Directory.Exists( dir ) )
                 System.IO.Directory.CreateDirectory( dir );
 
-            // Always write current serialized data to the source file (absolute path).
+            // Always write current serialized data to the source file
             var json = storage.Serialize();
             var jsonText = json.ToJsonString();
             System.IO.File.WriteAllText( absPath, jsonText );
 
-            // Register the written file so the asset system indexes and compiles it.
-            // RegisterFile takes the ABSOLUTE path — the previous CompileResource call
-            // passed a bare relative path that the native compiler resolved against the
-            // engine install dir (process CWD), logging "Could not find file
-            // '...\sbox\terrain_data\...'" and a NullReference inside the compiler.
-            var asset = AssetSystem.RegisterFile( absPath )
-                     ?? AssetSystem.FindByPath( relativePath );
+            // Compile the resource data so the engine has an up-to-date .terrain_c
+            AssetSystem.CompileResource( relativePath, jsonText );
+
+            // Find or register the asset so we can load the compiled resource
+            var asset = AssetSystem.FindByPath( relativePath )
+                     ?? AssetSystem.RegisterFile( absPath );
 
             if ( asset == null )
             {
-                Log.Warning( $"[terrain] Asset not registered after write: {relativePath}" );
+                Log.Warning( $"[terrain] Asset not found after compile: {relativePath}" );
                 return false;
             }
-
-            // RegisterFile alone may hand back the cached asset without recompiling the
-            // rewritten bytes; force a compile so the .terrain_c reflects the new data
-            // (same pattern as AssetManageHandler.Save).
-            asset.Compile( true );
 
             // If storage already points to a valid file, the rewrite + recompile is enough
             var alreadyBacked = !string.IsNullOrEmpty( storage.ResourcePath )
@@ -1425,107 +1427,6 @@ internal static class TerrainHandler
         return total / maxValue;
     }
 
-    // ── configure_clutter ───────────────────────────────────────────
-
-    private static object ConfigureClutter( Scene scene, JsonElement args )
-    {
-        var id = HandlerBase.GetString( args, "id" );
-        if ( string.IsNullOrEmpty( id ) )
-            return HandlerBase.Error( "Missing required 'id' parameter.", "configure_clutter" );
-
-        var go = SceneHelpers.FindByIdOrThrow( scene, id, "configure_clutter" );
-        var clutter = go.Components.Get<Sandbox.Clutter.ClutterComponent>();
-        if ( clutter == null )
-            return HandlerBase.Error( $"No ClutterComponent found on '{go.Name}'.", "configure_clutter" );
-
-        var defPath = HandlerBase.GetString( args, "definition" );
-        if ( !string.IsNullOrEmpty( defPath ) )
-        {
-            var def = ResourceLibrary.Get<Sandbox.Clutter.ClutterDefinition>( defPath );
-            if ( def == null )
-                return HandlerBase.Error(
-                    $"ClutterDefinition not found at '{defPath}'.",
-                    "configure_clutter",
-                    "User-created .clutter files must live under 'Assets/'. Path is relative to Assets/ (e.g. 'volcano_ground.clutter' for Assets/volcano_ground.clutter, no 'Assets/' prefix)." );
-            clutter.Clutter = def;
-        }
-
-        if ( HandlerBase.TryGetInt( args, "seed", out var s ) ) clutter.Seed = s;
-
-        var modeStr = HandlerBase.GetString( args, "mode" );
-        var modeParsed = HandlerBase.ResolveEnum<Sandbox.Clutter.ClutterComponent.ClutterMode>( modeStr, "mode", "configure_clutter" );
-        if ( modeParsed.HasValue ) clutter.Mode = modeParsed.Value;
-
-        // Post-condition: Clutter reference should be non-null if a definition path was provided.
-        var defAssigned = clutter.Clutter;
-        if ( !string.IsNullOrEmpty( defPath ) && defAssigned == null )
-            return HandlerBase.Error(
-                $"configure_clutter: definition '{defPath}' was provided but Clutter field is null after assignment. " +
-                "ResourceLibrary silently failed to resolve the asset.",
-                "configure_clutter",
-                "Confirm the .clutter file is under 'Assets/' via 'asset_query.get_status'." );
-
-        return HandlerBase.Success( new
-        {
-            message = $"Configured ClutterComponent on '{go.Name}': seed={clutter.Seed}, mode={clutter.Mode}.",
-            verified = new
-            {
-                clutter_assigned = defAssigned?.ResourceName,
-                seed = clutter.Seed,
-                mode = clutter.Mode.ToString()
-            }
-        } );
-    }
-
-    // ── regenerate_clutter ──────────────────────────────────────────
-
-    private static object RegenerateClutter( Scene scene, JsonElement args )
-    {
-        var id = HandlerBase.GetString( args, "id" );
-        if ( string.IsNullOrEmpty( id ) )
-            return HandlerBase.Error( "Missing required 'id' parameter.", "regenerate_clutter" );
-
-        var go = SceneHelpers.FindByIdOrThrow( scene, id, "regenerate_clutter" );
-        var clutter = go.Components.Get<Sandbox.Clutter.ClutterComponent>();
-        if ( clutter == null )
-            return HandlerBase.Error( $"No ClutterComponent found on '{go.Name}'.", "regenerate_clutter" );
-
-        var minStr = HandlerBase.GetString( args, "bounds_min" );
-        var maxStr = HandlerBase.GetString( args, "bounds_max" );
-
-        if ( !string.IsNullOrEmpty( minStr ) && !string.IsNullOrEmpty( maxStr ) )
-        {
-            var min = HandlerBase.ParseVector3( minStr );
-            var max = HandlerBase.ParseVector3( maxStr );
-            clutter.InvalidateTilesInBounds( new BBox( min, max ) );
-            return HandlerBase.Confirm( $"Regenerated clutter tiles in bounds on '{go.Name}'." );
-        }
-
-        clutter.Generate();
-        return HandlerBase.Confirm( $"Regenerated all clutter on '{go.Name}'." );
-    }
-
-    // ── clear_clutter ───────────────────────────────────────────────
-
-    private static object ClearClutter( Scene scene, JsonElement args )
-    {
-        var id = HandlerBase.GetString( args, "id" );
-        if ( string.IsNullOrEmpty( id ) )
-            return HandlerBase.Error( "Missing required 'id' parameter.", "clear_clutter" );
-
-        var go = SceneHelpers.FindByIdOrThrow( scene, id, "clear_clutter" );
-        var clutter = go.Components.Get<Sandbox.Clutter.ClutterComponent>();
-        if ( clutter == null )
-            return HandlerBase.Error( $"No ClutterComponent found on '{go.Name}'.", "clear_clutter" );
-
-        if ( clutter.Infinite )
-            clutter.ClearInfinite();
-        else
-            clutter.Clear();
-
-        return HandlerBase.Confirm( $"Cleared all clutter on '{go.Name}'." );
-    }
-
     // ── Helpers ───────────────────────────────────────────────────────
 
     /// <summary>Find the Terrain component by id param or by scanning the scene.</summary>
@@ -1559,5 +1460,121 @@ internal static class TerrainHandler
         }
 
         return terrain;
+    }
+
+    // ── Clutter scattering ────────────────────────────────────────────
+    //
+    // Ported from upstream Arenula e01504f (2026-08-05). ClutterComponent
+    // scatters models across terrain from a .clutter definition. These three
+    // are the authoring loop: point it at a definition, re-scatter after a
+    // heightmap edit, wipe it.
+
+    private static object ConfigureClutter( Scene scene, JsonElement args )
+    {
+        var (clutter, go, error) = RequireClutter( scene, args, "configure_clutter" );
+        if ( clutter == null ) return error;
+
+        var defPath = HandlerBase.GetString( args, "definition" );
+        if ( !string.IsNullOrEmpty( defPath ) )
+        {
+            var def = ResourceLibrary.Get<Sandbox.Clutter.ClutterDefinition>( defPath );
+            if ( def == null )
+                return HandlerBase.Error(
+                    $"ClutterDefinition not found at '{defPath}'.",
+                    "configure_clutter",
+                    "User-created .clutter files must live under 'Assets/'. The path is relative to Assets/ " +
+                    "(e.g. 'volcano_ground.clutter' for Assets/volcano_ground.clutter — no 'Assets/' prefix).",
+                    null,
+                    McpErrorCode.NotFound );
+            clutter.Clutter = def;
+        }
+
+        if ( HandlerBase.TryGetInt( args, "seed", out var seed ) )
+            clutter.Seed = seed;
+
+        var mode = HandlerBase.ResolveEnum<Sandbox.Clutter.ClutterComponent.ClutterMode>(
+            HandlerBase.GetString( args, "mode" ), "mode", "configure_clutter" );
+        if ( mode.HasValue ) clutter.Mode = mode.Value;
+
+        // Post-condition: a definition was asked for, so one must be attached.
+        // ResourceLibrary can resolve to null without throwing, and a success
+        // response over a null Clutter field is the silent-no-op case.
+        if ( !string.IsNullOrEmpty( defPath ) && clutter.Clutter == null )
+            return HandlerBase.Error(
+                $"Definition '{defPath}' was accepted but the Clutter field is null afterwards — nothing was attached.",
+                "configure_clutter",
+                "Confirm the .clutter file is under 'Assets/' with asset_query.get_status.",
+                null,
+                McpErrorCode.NotFound );
+
+        return HandlerBase.Success( new
+        {
+            message = $"Configured ClutterComponent on '{go.Name}': seed={clutter.Seed}, mode={clutter.Mode}.",
+            verified = new
+            {
+                clutter_assigned = clutter.Clutter?.ResourceName,
+                seed = clutter.Seed,
+                mode = clutter.Mode.ToString(),
+                infinite = clutter.Infinite
+            }
+        } );
+    }
+
+    private static object RegenerateClutter( Scene scene, JsonElement args )
+    {
+        var (clutter, go, error) = RequireClutter( scene, args, "regenerate_clutter" );
+        if ( clutter == null ) return error;
+
+        var minStr = HandlerBase.GetString( args, "bounds_min" );
+        var maxStr = HandlerBase.GetString( args, "bounds_max" );
+
+        if ( !string.IsNullOrEmpty( minStr ) && !string.IsNullOrEmpty( maxStr ) )
+        {
+            var bounds = new BBox( HandlerBase.ParseVector3( minStr ), HandlerBase.ParseVector3( maxStr ) );
+            clutter.InvalidateTilesInBounds( bounds );
+            return HandlerBase.Confirm(
+                $"Invalidated clutter tiles within ({bounds.Mins} → {bounds.Maxs}) on '{go.Name}'; they regenerate over subsequent frames." );
+        }
+
+        clutter.Generate();
+        return HandlerBase.Confirm( $"Regenerated all clutter on '{go.Name}'." );
+    }
+
+    private static object ClearClutter( Scene scene, JsonElement args )
+    {
+        var (clutter, go, error) = RequireClutter( scene, args, "clear_clutter" );
+        if ( clutter == null ) return error;
+
+        // Infinite (streamed) and volume clutter have separate clear paths;
+        // calling the wrong one leaves the scatter on screen and still reports success.
+        var infinite = clutter.Infinite;
+        if ( infinite ) clutter.ClearInfinite();
+        else clutter.Clear();
+
+        return HandlerBase.Confirm(
+            $"Cleared {( infinite ? "infinite-mode" : "volume" )} clutter on '{go.Name}'." );
+    }
+
+    /// <summary>
+    /// Resolve the ClutterComponent named by 'id'. Returns a null component plus
+    /// the error response to hand back when it cannot be found.
+    /// </summary>
+    private static (Sandbox.Clutter.ClutterComponent clutter, GameObject go, object error) RequireClutter(
+        Scene scene, JsonElement args, string action )
+    {
+        var id = HandlerBase.GetString( args, "id" );
+        if ( string.IsNullOrEmpty( id ) )
+            return ( null, null, HandlerBase.Error( "Missing required 'id' parameter.", action ) );
+
+        var go = SceneHelpers.FindByIdOrThrow( scene, id, action );
+        var clutter = go.Components.Get<Sandbox.Clutter.ClutterComponent>();
+        if ( clutter == null )
+            return ( null, go, HandlerBase.Error(
+                $"No ClutterComponent on '{go.Name}'.", action,
+                "Add one with component.add type='ClutterComponent'.",
+                null,
+                McpErrorCode.NotFound ) );
+
+        return ( clutter, go, null );
     }
 }

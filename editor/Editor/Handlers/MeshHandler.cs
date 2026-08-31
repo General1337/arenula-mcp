@@ -123,7 +123,9 @@ internal static class MeshHandler
 
     private static object CreatePlane( JsonElement args )
     {
-        var scene = HandlerBase.RequireScene( "create_plane" );
+        var scene = SceneHelpers.ResolveScene();
+        if ( scene == null )
+            return HandlerBase.Error( "No active scene.", "create_plane" );
 
         var posStr = HandlerBase.GetString( args, "position" );
         var position = posStr != null ? HandlerBase.ParseVector3( posStr ) : Vector3.Zero;
@@ -183,7 +185,9 @@ internal static class MeshHandler
 
     private static object CreateCylinder( JsonElement args )
     {
-        var scene = HandlerBase.RequireScene( "create_cylinder" );
+        var scene = SceneHelpers.ResolveScene();
+        if ( scene == null )
+            return HandlerBase.Error( "No active scene.", "create_cylinder" );
 
         var posStr = HandlerBase.GetString( args, "position" );
         var position = posStr != null ? HandlerBase.ParseVector3( posStr ) : Vector3.Zero;
@@ -290,8 +294,15 @@ internal static class MeshHandler
         }
         else
         {
-            Vector3 normal = Vector3.Up;
+            // 2026-04-23 — ComputeFaceNormal returns void (verified via
+            // sbox-api search_members → Sandbox.PolygonMesh). An `out`
+            // param may be written to default on degenerate faces, so
+            // check LengthSquared after the call and fall back to Up
+            // when the normal is unusable.
+            Vector3 normal;
             mesh.ComputeFaceNormal( faceHandles[0], out normal );
+            if ( normal.LengthSquared < 1e-6f )
+                normal = Vector3.Up;
             offset = normal * 50f;
         }
 
@@ -398,6 +409,12 @@ internal static class MeshHandler
         var removeBehind = HandlerBase.GetBool( args, "remove_behind", true );
         var cap = HandlerBase.GetBool( args, "cap", true );
 
+        // 2026-04-21 — Plane assumes a unit normal. Client-supplied normals
+        // are often non-normalized (derived from raw XYZ deltas); clipping
+        // with a denormalized normal produces wrong half-space classification.
+        if ( planeNormal.LengthSquared < 1e-8f )
+            return HandlerBase.Error( "plane_normal must be non-zero.", "clip_faces" );
+        planeNormal = planeNormal.Normal;
         var plane = new Plane( planePoint, planeNormal );
 
         var outNewEdges = new List<HalfEdgeHandle>();
@@ -731,7 +748,9 @@ internal static class MeshHandler
 
     private static object CreateWedge( JsonElement args )
     {
-        var scene = HandlerBase.RequireScene( "create_wedge" );
+        var scene = SceneHelpers.ResolveScene();
+        if ( scene == null )
+            return HandlerBase.Error( "No active scene.", "create_wedge" );
 
         var posStr = HandlerBase.GetString( args, "position" );
         var position = posStr != null ? HandlerBase.ParseVector3( posStr ) : Vector3.Zero;
@@ -814,7 +833,9 @@ internal static class MeshHandler
 
     private static object CreateArch( JsonElement args )
     {
-        var scene = HandlerBase.RequireScene( "create_arch" );
+        var scene = SceneHelpers.ResolveScene();
+        if ( scene == null )
+            return HandlerBase.Error( "No active scene.", "create_arch" );
 
         var posStr = HandlerBase.GetString( args, "position" );
         var position = posStr != null ? HandlerBase.ParseVector3( posStr ) : Vector3.Zero;
@@ -910,10 +931,13 @@ internal static class MeshHandler
     }
 
     // ── create_block ──────────────────────────────────────────────────
+    // Ported from MeshEditHandlers.CreateBlock
 
     private static object CreateBlock( JsonElement args )
     {
-        var scene = HandlerBase.RequireScene( "create_block" );
+        var scene = SceneHelpers.ResolveScene();
+        if ( scene == null )
+            return HandlerBase.Error( "No active scene.", "create_block" );
 
         var posStr = HandlerBase.GetString( args, "position" );
         var position = posStr != null ? HandlerBase.ParseVector3( posStr ) : Vector3.Zero;
@@ -998,22 +1022,34 @@ internal static class MeshHandler
 
     private static object CreateClutter( JsonElement args )
     {
-        var scene = HandlerBase.RequireScene( "create_clutter" );
+        var scene = SceneHelpers.ResolveScene();
+        if ( scene == null )
+            return HandlerBase.Error( "No active scene.", "create_clutter" );
 
         var posStr = HandlerBase.GetString( args, "position" );
         var position = posStr != null ? HandlerBase.ParseVector3( posStr ) : Vector3.Zero;
 
-        var go = SceneHelpers.CreateChildObject( scene, args, "Clutter", position );
+        var go = scene.CreateObject();
+        go.Name = HandlerBase.GetString( args, "name" ) ?? "Clutter";
+        go.WorldPosition = position;
 
         var clutter = go.Components.Create<ClutterComponent>();
         clutter.Seed = HandlerBase.GetInt( args, "seed", 0 );
 
         var mode = HandlerBase.GetString( args, "mode", "Volume" );
-        clutter.Mode = HandlerBase.RequireEnum<ClutterComponent.ClutterMode>( mode, "mode", "create_clutter" );
+        if ( Enum.TryParse<ClutterComponent.ClutterMode>( mode, true, out var cm ) )
+            clutter.Mode = cm;
 
         var defPath = HandlerBase.GetString( args, "definition" );
         if ( !string.IsNullOrEmpty( defPath ) )
-            clutter.Clutter = HandlerBase.RequireResource<ClutterDefinition>( defPath, "create_clutter" );
+        {
+            var asset = AssetSystem.FindByPath( defPath );
+            if ( asset != null )
+            {
+                var def = asset.LoadResource<ClutterDefinition>();
+                if ( def != null ) clutter.Clutter = def;
+            }
+        }
 
         return HandlerBase.Success( new
         {
@@ -1026,10 +1062,13 @@ internal static class MeshHandler
     }
 
     // ── set_face_material ─────────────────────────────────────────────
+    // Ported from MeshEditHandlers.SetFaceMaterial
 
     private static object SetFaceMaterial( JsonElement args )
     {
-        var scene = HandlerBase.RequireScene( "set_face_material" );
+        var scene = SceneHelpers.ResolveScene();
+        if ( scene == null )
+            return HandlerBase.Error( "No active scene.", "set_face_material" );
 
         var id = HandlerBase.GetString( args, "id" );
         if ( string.IsNullOrEmpty( id ) )
@@ -1071,10 +1110,13 @@ internal static class MeshHandler
     }
 
     // ── set_texture_params ────────────────────────────────────────────
+    // Ported from MeshEditHandlers.SetTextureParameters
 
     private static object SetTextureParams( JsonElement args )
     {
-        var scene = HandlerBase.RequireScene( "set_texture_params" );
+        var scene = SceneHelpers.ResolveScene();
+        if ( scene == null )
+            return HandlerBase.Error( "No active scene.", "set_texture_params" );
 
         var id = HandlerBase.GetString( args, "id" );
         if ( string.IsNullOrEmpty( id ) )
@@ -1092,31 +1134,30 @@ internal static class MeshHandler
         // Parse UV axis vectors from "x,y,z" strings or use defaults
         var uAxisStr = HandlerBase.GetString( args, "u_axis" );
         var vAxisStr = HandlerBase.GetString( args, "v_axis" );
-        var uAxis = uAxisStr != null ? HandlerBase.ParseVector3( uAxisStr ) : new Vector3( 1, 0, 0 );
-        var vAxis = vAxisStr != null ? HandlerBase.ParseVector3( vAxisStr ) : new Vector3( 0, 0, 1 );
-
-        var offsetStr = HandlerBase.GetString( args, "offset" );
-        var offset = offsetStr != null ? HandlerBase.ParseVector2( offsetStr ) : new Vector2( 0, 0 );
+        var vAxisU = uAxisStr != null ? HandlerBase.ParseVector3( uAxisStr ) : new Vector3( 1, 0, 0 );
+        var vAxisV = vAxisStr != null ? HandlerBase.ParseVector3( vAxisStr ) : new Vector3( 0, 0, 1 );
 
         var scaleStr = HandlerBase.GetString( args, "scale" );
-        var scale = scaleStr != null ? HandlerBase.ParseVector2( scaleStr ) : new Vector2( 1, 1 );
-
-        // The engine carries the texture offset in the w component of each axis, not as a
-        // separate argument: SetFaceTextureParameters assigns axisU.w -> TextureOffset.x
-        // and axisV.w -> TextureOffset.y. Pack it here, where the parsed names are still
-        // in view, rather than anywhere further down.
-        var axisU = new Vector4( uAxis, offset.x );
-        var axisV = new Vector4( vAxis, offset.y );
+        Vector2 scale;
+        if ( scaleStr != null )
+        {
+            scale = HandlerBase.ParseVector2( scaleStr );
+        }
+        else
+        {
+            scale = new Vector2( 1, 1 );
+        }
 
         if ( faceIndex >= 0 )
         {
-            if ( !MaterialHelper.SetTextureParameters( mesh, faceIndex, axisU, axisV, scale ) )
+            if ( !MaterialHelper.SetTextureParameters( mesh, faceIndex, vAxisU, vAxisV, scale ) )
                 return HandlerBase.Error( $"Invalid face index {faceIndex}.", "set_texture_params" );
         }
         else
         {
             foreach ( var hFace in mesh.FaceHandles )
-                mesh.SetFaceTextureParameters( hFace, axisU, axisV, scale );
+                mesh.SetFaceTextureParameters( hFace,
+                    new Vector4( vAxisU, 0f ), new Vector4( vAxisV, 0f ), scale );
         }
 
         return HandlerBase.Confirm( faceIndex >= 0
@@ -1125,10 +1166,13 @@ internal static class MeshHandler
     }
 
     // ── set_vertex_position ───────────────────────────────────────────
+    // Ported from MeshEditHandlers.SetVertexPosition
 
     private static object SetVertexPosition( JsonElement args )
     {
-        var scene = HandlerBase.RequireScene( "set_vertex_position" );
+        var scene = SceneHelpers.ResolveScene();
+        if ( scene == null )
+            return HandlerBase.Error( "No active scene.", "set_vertex_position" );
 
         var id = HandlerBase.GetString( args, "id" );
         if ( string.IsNullOrEmpty( id ) )
@@ -1159,10 +1203,13 @@ internal static class MeshHandler
     }
 
     // ── set_vertex_color ──────────────────────────────────────────────
+    // Ported from MeshEditHandlers.SetVertexColor
 
     private static object SetVertexColor( JsonElement args )
     {
-        var scene = HandlerBase.RequireScene( "set_vertex_color" );
+        var scene = SceneHelpers.ResolveScene();
+        if ( scene == null )
+            return HandlerBase.Error( "No active scene.", "set_vertex_color" );
 
         var id = HandlerBase.GetString( args, "id" );
         if ( string.IsNullOrEmpty( id ) )
@@ -1182,10 +1229,6 @@ internal static class MeshHandler
         if ( !hVertex.IsValid )
             return HandlerBase.Error( $"Invalid vertex index {vertexIndex}.", "set_vertex_color" );
 
-        var hHalfEdge = mesh.HalfEdgeHandleFromIndex( vertexIndex );
-        if ( !hHalfEdge.IsValid )
-            return HandlerBase.Error( $"Invalid half-edge for vertex {vertexIndex}.", "set_vertex_color" );
-
         var colorStr = HandlerBase.GetString( args, "color" );
         Color color;
         if ( !string.IsNullOrEmpty( colorStr ) )
@@ -1201,16 +1244,37 @@ internal static class MeshHandler
                 HandlerBase.GetFloat( args, "a", 1f ) );
         }
 
-        mesh.SetVertexColor( hHalfEdge, color );
+        // 2026-04-21 — half-edge mesh stores color per face-vertex (each
+        // vertex has one color per face it touches). Prior impl called
+        // HalfEdgeHandleFromIndex(vertexIndex) which indexes the half-edge
+        // space with a vertex index, returning an unrelated half-edge and
+        // silently painting the wrong face-vertex. Correct operation:
+        // enumerate half-edges, set color on every face-vertex whose
+        // backing vertex is the target.
+        int painted = 0;
+        foreach ( var he in mesh.HalfEdgeHandles )
+        {
+            if ( mesh.GetVertexConnectedToFaceVertex( he ).Index == hVertex.Index )
+            {
+                mesh.SetVertexColor( he, color );
+                painted++;
+            }
+        }
 
-        return HandlerBase.Confirm( $"Set vertex {vertexIndex} color on '{go.Name}'." );
+        if ( painted == 0 )
+            return HandlerBase.Error( $"Vertex {vertexIndex} has no incident face-vertices (mesh may be malformed).", "set_vertex_color" );
+
+        return HandlerBase.Confirm( $"Set vertex {vertexIndex} color on '{go.Name}' ({painted} face-vertex slot(s))." );
     }
 
     // ── set_vertex_blend ──────────────────────────────────────────────
+    // Ported from MeshEditHandlers.SetVertexBlend
 
     private static object SetVertexBlend( JsonElement args )
     {
-        var scene = HandlerBase.RequireScene( "set_vertex_blend" );
+        var scene = SceneHelpers.ResolveScene();
+        if ( scene == null )
+            return HandlerBase.Error( "No active scene.", "set_vertex_blend" );
 
         var id = HandlerBase.GetString( args, "id" );
         if ( string.IsNullOrEmpty( id ) )
@@ -1230,26 +1294,39 @@ internal static class MeshHandler
         if ( !hVertex.IsValid )
             return HandlerBase.Error( $"Invalid vertex index {vertexIndex}.", "set_vertex_blend" );
 
-        var hHalfEdge = mesh.HalfEdgeHandleFromIndex( vertexIndex );
-        if ( !hHalfEdge.IsValid )
-            return HandlerBase.Error( $"Invalid half-edge for vertex {vertexIndex}.", "set_vertex_blend" );
-
         var blend = new Color(
             HandlerBase.GetFloat( args, "r", 0f ),
             HandlerBase.GetFloat( args, "g", 0f ),
             HandlerBase.GetFloat( args, "b", 0f ),
             HandlerBase.GetFloat( args, "blend", 0f ) );
 
-        mesh.SetVertexBlend( hHalfEdge, blend );
+        // 2026-04-21 — same bug class as set_vertex_color above. See comment
+        // there. Half-edge blend is per face-vertex; apply to every incident
+        // face-vertex slot.
+        int painted = 0;
+        foreach ( var he in mesh.HalfEdgeHandles )
+        {
+            if ( mesh.GetVertexConnectedToFaceVertex( he ).Index == hVertex.Index )
+            {
+                mesh.SetVertexBlend( he, blend );
+                painted++;
+            }
+        }
 
-        return HandlerBase.Confirm( $"Set vertex {vertexIndex} blend on '{go.Name}'." );
+        if ( painted == 0 )
+            return HandlerBase.Error( $"Vertex {vertexIndex} has no incident face-vertices (mesh may be malformed).", "set_vertex_blend" );
+
+        return HandlerBase.Confirm( $"Set vertex {vertexIndex} blend on '{go.Name}' ({painted} face-vertex slot(s))." );
     }
 
     // ── get_info ──────────────────────────────────────────────────────
+    // Ported from MeshEditHandlers.GetMeshInfo
 
     private static object GetInfo( JsonElement args )
     {
-        var scene = HandlerBase.RequireScene( "get_info" );
+        var scene = SceneHelpers.ResolveScene();
+        if ( scene == null )
+            return HandlerBase.Error( "No active scene.", "get_info" );
 
         var id = HandlerBase.GetString( args, "id" );
         if ( string.IsNullOrEmpty( id ) )

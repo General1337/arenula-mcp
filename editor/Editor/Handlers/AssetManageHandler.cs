@@ -10,6 +10,7 @@ namespace Arenula;
 /// <summary>
 /// asset_manage tool: create, delete, rename, move, save, reload, get_references.
 /// All actions are destructive (modify files on disk).
+/// Ported from Ozmium OzmiumAssetHandlers.ReloadAsset.
 /// New actions: create, delete, rename, move, save.
 /// get_references delegates to AssetQueryHandler.GetReferences.
 /// </summary>
@@ -54,16 +55,6 @@ internal static class AssetManageHandler
         if ( string.IsNullOrEmpty( path ) )
             return HandlerBase.Error( "Missing required 'path' parameter.", "create" );
 
-        // Guard: user-created assets must live under 'Assets/' to be indexed by ResourceLibrary.
-        // Files elsewhere appear in the Asset Browser but ResourceLibrary.Get returns null for them,
-        // which breaks any downstream tool that tries to load the resource (see 2026-04-16 clutter debug).
-        var normalizedPath = path.Replace( '\\', '/' ).TrimStart( '/' );
-        if ( !normalizedPath.StartsWith( "Assets/", StringComparison.OrdinalIgnoreCase ) )
-            return HandlerBase.Error(
-                $"Path '{path}' is not under 'Assets/'. User-created assets outside 'Assets/' are not indexed by ResourceLibrary, so tools that load the resource will silently get null.",
-                "create",
-                "Use a path like 'Assets/name.ext' or 'Assets/subfolder/name.ext' instead." );
-
         // Determine the correct file extension for the type
         // Common s&box asset types: Material (.vmat), SoundEvent (.sound),
         // GameResource subtypes (.asset), etc.
@@ -89,35 +80,19 @@ internal static class AssetManageHandler
 
             System.IO.File.WriteAllText( absPath, content );
 
-            // Immediately register the new file with the asset system
-            AssetSystem.RegisterFile( absPath );
-
-            // Path passed to AssetSystem/ResourceLibrary is relative to Assets/ (strip the leading 'Assets/').
-            // AssetSystem.FindByPath normalizes to this form, so we must query with the stripped path.
-            string resolvePath = path.Replace( '\\', '/' ).TrimStart( '/' );
-            if ( resolvePath.StartsWith( "Assets/", StringComparison.OrdinalIgnoreCase ) )
-                resolvePath = resolvePath.Substring( "Assets/".Length );
-
-            // Post-condition: verify the asset is discoverable via the asset system.
-            var asset = AssetSystem.FindByPath( resolvePath );
-            if ( asset == null )
-                return HandlerBase.Error(
-                    $"Asset file written to '{absPath}' but not registered with AssetSystem. " +
-                    "The file may need a manual refresh or the editor's asset indexer hasn't run.",
-                    "create",
-                    "Try restarting the editor or re-opening the project." );
+            // 2026-04-21 — do NOT call AssetSystem.RegisterFile here.
+            // Engine rescan picks up the new file; eager registration can leave
+            // stale entries in the Facepunch asset cache (no UnregisterFile API
+            // exists) which manifest as per-frame errors on the editor-internal
+            // 'Editor.LocalAssetLocations tool.frame' handler.
+            // MCP clients that need an immediate asset handle should call
+            // asset_manage.reload after create.
 
             return HandlerBase.Success( new
             {
                 message = $"Created asset '{path}' of type '{type}'.",
                 path,
-                absolutePath = absPath,
-                verified = new
-                {
-                    registered = true,
-                    resolve_path = resolvePath,
-                    asset_type = asset.AssetType?.FriendlyName ?? "unknown"
-                }
+                absolutePath = absPath
             } );
         }
         catch ( Exception ex )
@@ -131,7 +106,7 @@ internal static class AssetManageHandler
 
     private static object Delete( JsonElement args )
     {
-        var path = HandlerBase.GetAssetPath( args );
+        var path = SceneHelpers.NormalizePath( HandlerBase.GetString( args, "path" ) );
         if ( string.IsNullOrEmpty( path ) )
             return HandlerBase.Error( "Missing required 'path' parameter.", "delete" );
 
@@ -171,7 +146,7 @@ internal static class AssetManageHandler
 
     private static object Rename( JsonElement args )
     {
-        var path = HandlerBase.GetAssetPath( args );
+        var path = SceneHelpers.NormalizePath( HandlerBase.GetString( args, "path" ) );
         var newName = HandlerBase.GetString( args, "new_name" );
 
         if ( string.IsNullOrEmpty( path ) )
@@ -201,8 +176,12 @@ internal static class AssetManageHandler
             var newAbsPath = System.IO.Path.Combine( dir, newName );
             System.IO.File.Move( absPath, newAbsPath );
 
-            // Re-register the moved file with the asset system
-            AssetSystem.RegisterFile( newAbsPath );
+            // 2026-04-21 — do NOT call AssetSystem.RegisterFile(newAbsPath).
+            // Rename leaves the OLD path in the engine's asset cache (no
+            // UnregisterFile API exists). Registering the new path on top of
+            // that injects a second stale entry. The 'Editor.LocalAssetLocations
+            // tool.frame' spam in the editor console was traced to this pattern.
+            // Engine rescan picks up the new file and retires the old entry.
 
             // Compute new relative path
             var parentDir = System.IO.Path.GetDirectoryName( path );
@@ -228,7 +207,7 @@ internal static class AssetManageHandler
 
     private static object Move( JsonElement args )
     {
-        var path = HandlerBase.GetAssetPath( args );
+        var path = SceneHelpers.NormalizePath( HandlerBase.GetString( args, "path" ) );
         var destination = HandlerBase.GetString( args, "destination" );
 
         if ( string.IsNullOrEmpty( path ) )
@@ -262,8 +241,11 @@ internal static class AssetManageHandler
             var destAbsPath = System.IO.Path.Combine( destAbsDir, fileName );
             System.IO.File.Move( absPath, destAbsPath );
 
-            // Re-register the moved file with the asset system
-            AssetSystem.RegisterFile( destAbsPath );
+            // 2026-04-21 — do NOT call AssetSystem.RegisterFile(destAbsPath).
+            // See Rename handler for rationale: registering after File.Move
+            // leaves the old path in the engine's asset cache and injects a
+            // fresh entry, producing 'Editor.LocalAssetLocations tool.frame'
+            // per-frame errors. Engine rescan handles the transition.
 
             var newRelPath = destination.TrimEnd( '/' ) + "/" + fileName;
 
@@ -285,7 +267,7 @@ internal static class AssetManageHandler
 
     private static object Save( JsonElement args )
     {
-        var path = HandlerBase.GetAssetPath( args );
+        var path = SceneHelpers.NormalizePath( HandlerBase.GetString( args, "path" ) );
         if ( string.IsNullOrEmpty( path ) )
             return HandlerBase.Error( "Missing required 'path' parameter.", "save" );
 
@@ -306,10 +288,11 @@ internal static class AssetManageHandler
     }
 
     // ── reload ────────────────────────────────────────────────────────────
+    // Ported from OzmiumAssetHandlers.ReloadAsset
 
     private static object Reload( JsonElement args )
     {
-        var path = HandlerBase.GetAssetPath( args );
+        var path = SceneHelpers.NormalizePath( HandlerBase.GetString( args, "path" ) );
         if ( string.IsNullOrEmpty( path ) )
             return HandlerBase.Error( "Missing required 'path' parameter.", "reload" );
 
@@ -326,7 +309,77 @@ internal static class AssetManageHandler
         if ( asset == null )
             return HandlerBase.Error( $"Asset not found: '{path}'.", "reload" );
 
+        // Fail fast when the asset is referenced by a currently loaded scene
+        // (findings #5, 2026-06-11). Recompiling a live-referenced asset can blank
+        // or corrupt loaded scene state ("MCP self-heals but not 100%"). The cheap
+        // disk-text scan of each open scene's source file catches the common case
+        // BEFORE damage instead of after. Newly imported assets are not referenced
+        // by any scene yet, so the post-import "reload if invisible" flow is unaffected.
+        var force = HandlerBase.GetBool( args, "force", false );
+        if ( !force )
+        {
+            var referencedBy = FindLoadedSceneReferences( asset );
+            if ( referencedBy.Count > 0 )
+            {
+                return HandlerBase.Error(
+                    $"REFUSED: '{asset.Path}' is referenced by the currently loaded scene(s): " +
+                    $"{string.Join( ", ", referencedBy )}. Recompiling a live-referenced asset risks wiping or " +
+                    $"corrupting loaded scene state.",
+                    "reload",
+                    "Save your work and close/switch the scene first, or pass force:true to recompile anyway. " +
+                    "After a forced reload, run editor.reload_scene and check integrity.verified before any save_scene.",
+                    new { assetPath = asset.Path, referencedByLoadedScenes = referencedBy },
+                    McpErrorCode.ReloadRefusedSceneReferenced );
+            }
+        }
+
         asset.Compile( true );
-        return HandlerBase.Confirm( $"Recompile triggered for '{path}'." );
+        return HandlerBase.Confirm( $"Recompile triggered for '{path}'."
+            + ( force ? " (forced past loaded-scene reference check)" : "" ) );
+    }
+
+    /// <summary>
+    /// Scene resource paths among open editor sessions whose on-disk source text
+    /// references the asset — or that ARE the asset, for .scene reloads (highest risk).
+    /// Disk-text substring scan: scene JSON stores source-relative asset paths
+    /// (e.g. "meshy/thruster/thruster.vmdl"), which is exactly Asset.Path. Indirect
+    /// references (a .vmat used by a .vmdl placed in the scene) are NOT caught —
+    /// that would need a transitive GetReferences walk; documented limitation.
+    /// </summary>
+    private static List<string> FindLoadedSceneReferences( Asset asset )
+    {
+        var hits = new List<string>();
+        var assetPath = asset?.Path?.Replace( '\\', '/' );
+        if ( string.IsNullOrEmpty( assetPath ) ) return hits;
+
+        IEnumerable<SceneEditorSession> sessions;
+        try { sessions = SceneEditorSession.All ?? new List<SceneEditorSession>(); }
+        catch { return hits; }
+
+        foreach ( var session in sessions )
+        {
+            string scenePath = null;
+            try { scenePath = session?.Scene?.Source?.ResourcePath; } catch { }
+            if ( string.IsNullOrEmpty( scenePath ) ) continue;
+            var normScene = scenePath.Replace( '\\', '/' );
+
+            // Reloading the loaded scene file itself is the direct scene-wipe case.
+            if ( string.Equals( normScene, assetPath, StringComparison.OrdinalIgnoreCase ) )
+            {
+                hits.Add( normScene + " (is the loaded scene itself)" );
+                continue;
+            }
+
+            try
+            {
+                var abs = SceneIntegrityGuard.ResolveAbsolutePath( scenePath );
+                if ( string.IsNullOrEmpty( abs ) || !System.IO.File.Exists( abs ) ) continue;
+                var text = System.IO.File.ReadAllText( abs );
+                if ( text.IndexOf( assetPath, StringComparison.OrdinalIgnoreCase ) >= 0 )
+                    hits.Add( normScene );
+            }
+            catch { }
+        }
+        return hits;
     }
 }

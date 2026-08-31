@@ -12,12 +12,6 @@ namespace Arenula;
 /// </summary>
 internal static class HandlerBase
 {
-    private static readonly JsonSerializerOptions Json = new()
-    {
-        PropertyNamingPolicy = JsonNamingPolicy.CamelCase,
-        DefaultIgnoreCondition = System.Text.Json.Serialization.JsonIgnoreCondition.WhenWritingNull
-    };
-
     internal const int MaxResponseChars = 16384;
 
     // ── Success responses ──────────────────────────────────────────────
@@ -28,13 +22,14 @@ internal static class HandlerBase
         content = new object[] { new { type = "text", text } }
     };
 
-    /// <summary>Serialize an object to JSON and wrap as MCP success response.</summary>
+    /// <summary>Serialize an object to JSON and wrap as MCP success response.
+    /// Large responses are automatically paginated via CursorStore.</summary>
     internal static object Success( object data )
     {
-        var json = JsonSerializer.Serialize( data, Json );
+        var result = McpResult.Structured( data, out var json );
         if ( json.Length > MaxResponseChars )
-            json = json[..MaxResponseChars] + "\n... [truncated]";
-        return Text( json );
+            return CursorStore.StoreAndPage( json );
+        return result;
     }
 
     // ── Image responses ─────────────────────────────────────────────────
@@ -55,15 +50,31 @@ internal static class HandlerBase
 
     /// <summary>Return a tool execution error with action context and suggestion.</summary>
     internal static object Error( string message, string action = null, string suggestion = null )
+        => Error( message, action, suggestion, null, null );
+
+    /// <summary>Return a tool execution error with structured diagnostics for agents.</summary>
+    internal static object Error( string message, string action, string suggestion, object details )
+        => Error( message, action, suggestion, details, null );
+
+    /// <summary>
+    /// Return a tool execution error carrying a machine-branchable <c>error_code</c> from the
+    /// <see cref="McpErrorCode"/> taxonomy. Additive and backward compatible: <c>error</c>
+    /// (the prose message), <c>action</c>, <c>suggestion</c> and <c>details</c> are unchanged.
+    /// When a code is supplied the payload also carries <c>retryable</c> so agents can branch
+    /// retry-vs-fatal without regexing the message text.
+    /// </summary>
+    internal static object Error( string message, string action, string suggestion, object details, string errorCode )
     {
-        var error = new Dictionary<string, string> { ["error"] = message };
+        var error = new Dictionary<string, object> { ["error"] = message };
+        if ( errorCode != null )
+        {
+            error["error_code"] = errorCode;
+            error["retryable"] = McpErrorCode.IsRetryable( errorCode );
+        }
         if ( action != null ) error["action"] = action;
         if ( suggestion != null ) error["suggestion"] = suggestion;
-        return new
-        {
-            content = new object[] { new { type = "text", text = JsonSerializer.Serialize( error, Json ) } },
-            isError = true
-        };
+        if ( details != null ) error["details"] = details;
+        return McpResult.Structured( error, out _, isError: true );
     }
 
     /// <summary>Return a protocol-level error (invalid action, missing param).</summary>
@@ -117,12 +128,23 @@ internal static class HandlerBase
         return defaultValue;
     }
 
-    /// <summary>Extract an int parameter from JSON args, or return default.</summary>
+    /// <summary>
+    /// Extract an int parameter from JSON args, or return default.
+    /// A numeric STRING is accepted too ("4" as well as 4): plenty of MCP clients
+    /// stringify scalars, and before this a stringified number silently fell back
+    /// to the default — the caller then got a quietly wrong answer that still
+    /// reported success. Found 2026-08-05 when sample_grid returned a 10x10 grid
+    /// for a requested 4x4 and said samples_x=10.
+    /// </summary>
     internal static int GetInt( JsonElement args, string name, int defaultValue = 0 )
     {
         if ( args.ValueKind == JsonValueKind.Undefined ) return defaultValue;
-        if ( args.TryGetProperty( name, out var el ) && el.ValueKind == JsonValueKind.Number )
-            return el.GetInt32();
+        if ( !args.TryGetProperty( name, out var el ) ) return defaultValue;
+        if ( el.ValueKind == JsonValueKind.Number ) return el.GetInt32();
+        if ( el.ValueKind == JsonValueKind.String
+            && int.TryParse( el.GetString(), System.Globalization.NumberStyles.Integer,
+                System.Globalization.CultureInfo.InvariantCulture, out var parsed ) )
+            return parsed;
         return defaultValue;
     }
 
@@ -138,12 +160,20 @@ internal static class HandlerBase
         return defaultValue;
     }
 
-    /// <summary>Extract a float parameter from JSON args, or return default.</summary>
+    /// <summary>
+    /// Extract a float parameter from JSON args, or return default.
+    /// Accepts a numeric string as well as a JSON number — see <see cref="GetInt"/>
+    /// for why.
+    /// </summary>
     internal static float GetFloat( JsonElement args, string name, float defaultValue = 0f )
     {
         if ( args.ValueKind == JsonValueKind.Undefined ) return defaultValue;
-        if ( args.TryGetProperty( name, out var el ) && el.ValueKind == JsonValueKind.Number )
-            return el.GetSingle();
+        if ( !args.TryGetProperty( name, out var el ) ) return defaultValue;
+        if ( el.ValueKind == JsonValueKind.Number ) return el.GetSingle();
+        if ( el.ValueKind == JsonValueKind.String
+            && float.TryParse( el.GetString(), System.Globalization.NumberStyles.Float,
+                System.Globalization.CultureInfo.InvariantCulture, out var parsed ) )
+            return parsed;
         return defaultValue;
     }
 
@@ -162,6 +192,8 @@ internal static class HandlerBase
     /// <summary>Parse a "x,y,z" string into a Vector3.</summary>
     internal static Vector3 ParseVector3( string s )
     {
+        if ( string.IsNullOrWhiteSpace( s ) )
+            throw new ArgumentException( "Expected 'x,y,z' format, got empty string" );
         var parts = s.Split( ',' );
         if ( parts.Length != 3 ) throw new ArgumentException( $"Expected 'x,y,z' format, got '{s}'" );
         return new Vector3( float.Parse( parts[0].Trim() ), float.Parse( parts[1].Trim() ), float.Parse( parts[2].Trim() ) );
@@ -169,6 +201,8 @@ internal static class HandlerBase
 
     internal static Vector2 ParseVector2( string s )
     {
+        if ( string.IsNullOrWhiteSpace( s ) )
+            throw new ArgumentException( "Expected 'u,v' format, got empty string" );
         var parts = s.Split( ',' );
         if ( parts.Length != 2 ) throw new ArgumentException( $"Expected 'u,v' format, got '{s}'" );
         return new Vector2( float.Parse( parts[0].Trim() ), float.Parse( parts[1].Trim() ) );
@@ -198,10 +232,43 @@ internal static class HandlerBase
 
     internal static object Confirm( string message ) => Text( message );
 
-    // ── Warning helpers ───────────────────────────────────────────────
-    // Construct a single warning entry for the response envelope's "warnings" array.
-    // Use when an operation partially succeeded and the caller should know what was skipped.
+    // ── Project root resolution ───────────────────────────────────────
 
+    /// <summary>
+    /// Resolve the project root directory via the current project API.
+    /// Returns null if it cannot be determined.
+    /// </summary>
+    internal static string GetProjectRoot()
+    {
+        try
+        {
+            return Project.Current?.GetRootPath();
+        }
+        catch { return null; }
+    }
+
+    /// <summary>
+    /// Resolve a relative path to an absolute path under the project root.
+    /// Returns null (with error message) if the project root cannot be determined.
+    /// </summary>
+    internal static string ResolveProjectPath( string relativePath )
+    {
+        if ( System.IO.Path.IsPathRooted( relativePath ) )
+            return relativePath;
+
+        var root = GetProjectRoot();
+        if ( string.IsNullOrEmpty( root ) )
+            return null;
+
+        return System.IO.Path.Combine( root, relativePath.Replace( '/', System.IO.Path.DirectorySeparatorChar ) );
+    }
+
+    // ── Partial-success warning ───────────────────────────────────────
+
+    /// <summary>
+    /// Structured warning for an operation that partially succeeded. Use when the
+    /// caller needs to know what was skipped — a bare success response hides it.
+    /// </summary>
     internal static object Warning( string message, string field = null, string suggestion = null )
     {
         var w = new Dictionary<string, string> { ["message"] = message };
@@ -210,10 +277,20 @@ internal static class HandlerBase
         return w;
     }
 
-    // ── Resource resolution helpers ───────────────────────────────────
-    // RequireResource: errors if path is null/empty or resource not found.
-    // ResolveResource: returns null if path is null/empty; errors if provided-but-not-found.
-    // Both go through ResourceLibrary.Get<T> — works for any GameResource-derived type.
+    // ── Require / Resolve validation family ───────────────────────────
+    //
+    // Ported from upstream Arenula (2026-07 hardening batch). These exist to kill
+    // the silent-no-op class: a handler that receives a bad model path, a bad enum
+    // name or a missing id, skips the assignment, and still returns success. The
+    // caller then believes a write landed that never did.
+    //
+    // Convention throughout:
+    //   Require* — throws if the input is missing OR unresolvable.
+    //   Resolve* — returns null for a missing input (the caller meant "leave it"),
+    //              throws only when a value was supplied and could not be resolved.
+    //
+    // All of these throw InvalidOperationException, which the per-handler try/catch
+    // already converts into an Error response, so no call site needs new plumbing.
 
     internal static T RequireResource<T>( string path, string action, string hint = null ) where T : Resource
     {
@@ -224,7 +301,7 @@ internal static class HandlerBase
         {
             var extra = hint != null ? $" {hint}" : "";
             throw new InvalidOperationException(
-                $"{typeof(T).Name} not found at '{path}'.{extra} " +
+                $"{typeof( T ).Name} not found at '{path}'.{extra} " +
                 "User-authored assets must live under 'Assets/'. Path is relative to Assets/ " +
                 "(e.g. 'rifle.weapon' for Assets/rifle.weapon, no 'Assets/' prefix)." );
         }
@@ -237,7 +314,7 @@ internal static class HandlerBase
         return RequireResource<T>( path, action, hint );
     }
 
-    // Model and Material use their own static factories, not ResourceLibrary — separate helpers.
+    // Model and Material use their own static factories, not ResourceLibrary.
 
     internal static Model RequireModel( string path, string action )
     {
@@ -273,10 +350,7 @@ internal static class HandlerBase
         return RequireMaterial( path, action );
     }
 
-    // ── Enum parsing helpers ──────────────────────────────────────────
-    // RequireEnum: errors with valid-values list if value is invalid or empty.
-    // ResolveEnum: returns null if value is null/empty; errors if provided-but-invalid.
-
+    /// <summary>Parse an enum, listing the valid names in the error when it fails.</summary>
     internal static TEnum RequireEnum<TEnum>( string value, string paramName, string action )
         where TEnum : struct, Enum
     {
@@ -298,9 +372,10 @@ internal static class HandlerBase
         return RequireEnum<TEnum>( value, paramName, action );
     }
 
-    // ── Path guards ───────────────────────────────────────────────────
-    // Enforce that user-authored asset paths are under 'Assets/' (the only indexed content root).
-
+    /// <summary>
+    /// Enforce that a user-authored asset path is under 'Assets/'. Anything written
+    /// elsewhere is not indexed by ResourceLibrary, so every later load returns null.
+    /// </summary>
     internal static void RequireAssetsPath( string path, string action )
     {
         if ( string.IsNullOrEmpty( path ) )
@@ -312,10 +387,6 @@ internal static class HandlerBase
                 "by ResourceLibrary, so tools that load the resource will silently get null. " +
                 "Use a path like 'Assets/name.ext' or 'Assets/subfolder/name.ext'." );
     }
-
-    // ── GameObject lookup helpers ─────────────────────────────────────
-    // Require: errors if id is null/empty or GameObject not found.
-    // Resolve: returns null if id is null/empty; errors if provided-but-not-found.
 
     internal static GameObject RequireGameObjectById( Scene scene, string id, string action )
     {
@@ -335,46 +406,7 @@ internal static class HandlerBase
         return RequireGameObjectById( scene, id, action );
     }
 
-    // ── Project root resolution ───────────────────────────────────────
-
-    /// <summary>
-    /// Resolve the project root directory via the current project API.
-    /// Returns null if it cannot be determined.
-    /// </summary>
-    internal static string GetProjectRoot()
-    {
-        try
-        {
-            return Project.Current?.GetRootPath();
-        }
-        catch { return null; }
-    }
-
-    /// <summary>
-    /// Resolve a relative path to an absolute path under the project root.
-    /// Returns null (with error message) if the project root cannot be determined.
-    /// </summary>
-    internal static string ResolveProjectPath( string relativePath )
-    {
-        if ( System.IO.Path.IsPathRooted( relativePath ) )
-            return relativePath;
-
-        var root = GetProjectRoot();
-        if ( string.IsNullOrEmpty( root ) )
-            return null;
-
-        return System.IO.Path.Combine( root, relativePath.Replace( '/', System.IO.Path.DirectorySeparatorChar ) );
-    }
-
-    // ── Cleanup helpers (refactor-cleanup.md Cards 1/3/6/7) ───────────
-    // Additions introduced before any call-site migration — existing
-    // behavior unchanged. Batch 2 moves current boilerplate onto these.
-
-    /// <summary>
-    /// Scene companion to RequireGameObjectById: errors if no scene is active.
-    /// Throws InvalidOperationException — caught by each handler's top-level
-    /// try/catch and converted to HandlerBase.Error.
-    /// </summary>
+    /// <summary>Resolve the active scene, throwing a usable message when there isn't one.</summary>
     internal static Scene RequireScene( string action )
     {
         var scene = SceneHelpers.ResolveScene();
@@ -384,7 +416,13 @@ internal static class HandlerBase
         return scene;
     }
 
-    /// <summary>Try to extract a float. Returns true only if the property was provided.</summary>
+    // ── Presence-aware argument extraction ────────────────────────────
+    //
+    // The Get* accessors above cannot distinguish "caller passed 0" from "caller
+    // omitted the field", so a handler using them silently overwrites a property
+    // with a default. These return false when the field was not supplied.
+
+    /// <summary>Extract a float. Returns true only if the property was actually provided.</summary>
     internal static bool TryGetFloat( JsonElement args, string name, out float value )
     {
         if ( args.ValueKind != JsonValueKind.Undefined &&
@@ -397,7 +435,7 @@ internal static class HandlerBase
         return false;
     }
 
-    /// <summary>Try to extract an int. Returns true only if the property was provided.</summary>
+    /// <summary>Extract an int. Returns true only if the property was actually provided.</summary>
     internal static bool TryGetInt( JsonElement args, string name, out int value )
     {
         if ( args.ValueKind != JsonValueKind.Undefined &&
@@ -410,13 +448,13 @@ internal static class HandlerBase
         return false;
     }
 
-    /// <summary>Try to extract a bool. Returns true only if the property was provided.</summary>
+    /// <summary>Extract a bool. Returns true only if the property was actually provided.</summary>
     internal static bool TryGetBool( JsonElement args, string name, out bool value )
     {
         if ( args.ValueKind != JsonValueKind.Undefined &&
              args.TryGetProperty( name, out var el ) )
         {
-            if ( el.ValueKind == JsonValueKind.True )  { value = true;  return true; }
+            if ( el.ValueKind == JsonValueKind.True ) { value = true; return true; }
             if ( el.ValueKind == JsonValueKind.False ) { value = false; return true; }
         }
         value = false;
@@ -424,8 +462,9 @@ internal static class HandlerBase
     }
 
     /// <summary>
-    /// Parse a color string from args and invoke the setter if provided and parseable.
-    /// Preserves the silent-failure behavior of the inline pattern it replaces.
+    /// Parse a colour string from args and invoke the setter only when one was given.
+    /// Deliberately silent on an unparseable value — this replaces an inline pattern
+    /// with the same behaviour, and tightening it is a separate decision.
     /// </summary>
     internal static void ApplyColor( JsonElement args, string name, Action<Color> apply )
     {
@@ -440,10 +479,61 @@ internal static class HandlerBase
     }
 
     /// <summary>
-    /// Extract an asset path from args and strip the leading "Assets/" prefix.
-    /// AssetSystem.FindByPath silently returns null if the prefix is left in;
-    /// this helper removes that foot-gun in the 14 existing call sites.
+    /// Extract an asset path from args with the leading "Assets/" prefix stripped.
+    /// AssetSystem.FindByPath returns null rather than erroring when the prefix is
+    /// left on, which reads as "asset missing" instead of "path wrong".
     /// </summary>
     internal static string GetAssetPath( JsonElement args, string name = "path" )
         => SceneHelpers.NormalizePath( GetString( args, name ) );
+}
+
+/// <summary>
+/// Machine-branchable error-code taxonomy for <see cref="HandlerBase.Error(string,string,string,object,string)"/>.
+/// Agents branch on <c>error_code</c> + <c>retryable</c> instead of regexing prose
+/// (even BatchHandler resorts to <c>resultJson.Contains("\"isError\":true")</c> today).
+/// Codes are stable string constants — never renumber/rename once shipped; add new ones instead.
+/// </summary>
+internal static class McpErrorCode
+{
+    // Environment / addressing — fatal until the caller changes something.
+    internal const string NoProjects        = "NO_PROJECTS";          // no project loaded / project root unresolvable
+    internal const string NoActiveSession   = "NO_ACTIVE_SESSION";    // SceneEditorSession.Active is null
+    internal const string NoActiveScene     = "NO_ACTIVE_SCENE";      // no scene open / resolvable
+    internal const string NotFound          = "NOT_FOUND";            // GameObject / component / asset / path not found
+    internal const string InvalidArgs       = "INVALID_ARGS";         // missing or malformed required parameter
+    internal const string UnknownAction     = "UNKNOWN_ACTION";       // action string not in the tool's switch
+
+    // Compile / hotload pipeline.
+    internal const string CompileTimeout    = "COMPILE_TIMEOUT";      // compile wait exceeded timeout_ms — retry (longer timeout) is sane
+    internal const string CompileFailed     = "COMPILE_FAILED";       // diagnostics with severity=error — fix code, don't blind-retry
+    internal const string HotloadStalled    = "HOTLOAD_STALLED";      // DLL swap did not take; new types unresolved
+    internal const string TypeLibraryCorrupted = "TYPELIBRARY_CORRUPTED"; // InstanceUpgrader 'couldn't upgrade' — cold restart territory
+    internal const string VerifyFailed      = "VERIFY_FAILED";        // a verification stage reported failures
+
+    // Runtime pawn readiness / ownership.
+    internal const string PawnNotReady      = "PAWN_NOT_READY";       // play began, but no active-scene pawn exists yet
+    internal const string PawnOwnerNotLocal = "PAWN_OWNER_NOT_LOCAL"; // active-scene controllers exist, none is locally controlled
+
+    // Contention — transient by definition; re-issue the same call after a pause.
+    internal const string LockedBy          = "LOCKED_BY";            // GameObject/file lock held by another agent
+    internal const string OperationInProgress = "OPERATION_IN_PROGRESS"; // operation coordinator busy / mutex contention
+    internal const string EditorLeaseRequired = "EDITOR_LEASE_REQUIRED"; // mutation without the editor lease — acquire it, don't blind-retry
+    internal const string EditorLeaseStateUnknown = "EDITOR_LEASE_STATE_UNKNOWN"; // caller/coordinator identity unauthenticated — re-identify, don't blind-retry
+
+    // Integrity guards (findings #5) — needs a state change, not a retry.
+    internal const string SaveRefusedIntegrityHold = "SAVE_REFUSED_INTEGRITY_HOLD"; // reload hold active on this scene
+    internal const string SaveRefusedCountDeficit  = "SAVE_REFUSED_COUNT_DEFICIT";  // memory<disk deficit over threshold
+    internal const string ReloadRefusedSceneReferenced = "RELOAD_REFUSED_SCENE_REFERENCED"; // asset referenced by a loaded scene
+
+    // Catch-all.
+    internal const string CursorExpired     = "CURSOR_EXPIRED";       // continue-tool cursor gone (60s TTL) — re-run the original call
+    internal const string InternalException = "INTERNAL_EXCEPTION";   // unhandled exception inside the handler
+
+    private static readonly HashSet<string> Retryable = new( StringComparer.Ordinal )
+    {
+        LockedBy, OperationInProgress, CompileTimeout, PawnNotReady
+    };
+
+    /// <summary>True when blind re-issue of the same call is a sane next step (contention/timeout class).</summary>
+    internal static bool IsRetryable( string code ) => code != null && Retryable.Contains( code );
 }

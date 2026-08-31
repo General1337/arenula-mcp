@@ -20,6 +20,8 @@ internal static class GameObjectHandler
             {
                 "create"          => Create( args ),
                 "destroy"         => Destroy( args ),
+                "destroy_by_name" => DestroyByName( args ),
+                "destroy_children" => DestroyChildren( args ),
                 "duplicate"       => Duplicate( args ),
                 "reparent"        => Reparent( args ),
                 "rename"          => Rename( args ),
@@ -28,7 +30,7 @@ internal static class GameObjectHandler
                 "set_transform"   => SetTransform( args ),
                 "batch_transform" => BatchTransform( args ),
                 _ => HandlerBase.Error( $"Unknown action '{action}' for tool 'gameobject'.", action,
-                    "Valid actions: create, destroy, duplicate, reparent, rename, enable, set_tags, set_transform, batch_transform" )
+                    "Valid actions: create, destroy, destroy_by_name, destroy_children, duplicate, reparent, rename, enable, set_tags, set_transform, batch_transform" )
             };
         }
         catch ( Exception ex )
@@ -79,15 +81,164 @@ internal static class GameObjectHandler
     {
         var scene = HandlerBase.RequireScene( "destroy" );
 
+        // Support bulk destroy by name (e.g. destroy all "info_player_start" under a parent)
+        var name = HandlerBase.GetString( args, "name" );
+        var parentId = HandlerBase.GetString( args, "parent_id" );
+        if ( !string.IsNullOrEmpty( name ) && !string.IsNullOrEmpty( parentId ) )
+        {
+            // Use deep search to find parent (handles map-spawned objects)
+            var parent = SceneHelpers.FindById( scene, parentId );
+            if ( parent == null && Guid.TryParse( parentId, out var pguid ) )
+                parent = FindGameObjectDeep( scene, pguid );
+
+            if ( parent == null )
+                return HandlerBase.Error( $"Parent '{parentId}' not found.", "destroy" );
+
+            var toDestroy = parent.Children.Where( c => c.Name == name ).ToList();
+            foreach ( var go in toDestroy )
+                go.Destroy();
+
+            return HandlerBase.Confirm( $"Destroyed {toDestroy.Count} objects named '{name}' under '{parent.Name}'." );
+        }
+
         var id = HandlerBase.GetString( args, "id" );
         if ( string.IsNullOrEmpty( id ) )
             return HandlerBase.Error( "Missing required 'id' parameter.", "destroy" );
 
-        var go = SceneHelpers.FindByIdOrThrow( scene, id, "destroy" );
-        var displayName = go.Name;
-        go.Destroy();
+        // Try FindById first (now uses GetAllObjects + deep walk), then fall back to local deep search
+        var target = SceneHelpers.FindById( scene, id );
+        if ( target == null && Guid.TryParse( id, out var guid ) )
+        {
+            target = FindGameObjectDeep( scene, guid );
+        }
+
+        if ( target == null )
+            return HandlerBase.Error( $"GameObject '{id}' not found in scene", "destroy" );
+
+        var displayName = target.Name;
+        target.Destroy();
 
         return HandlerBase.Confirm( $"Destroyed '{displayName}' ({id})." );
+    }
+
+    // ── destroy_by_name ──────────────────────────────────────────────
+
+    private static object DestroyByName( JsonElement args )
+    {
+        var scene = SceneHelpers.ResolveScene();
+        if ( scene == null )
+            return HandlerBase.Error( "No active scene.", "destroy_by_name" );
+
+        var name = HandlerBase.GetString( args, "name" );
+        if ( string.IsNullOrEmpty( name ) )
+            return HandlerBase.Error( "Missing required 'name' parameter.", "destroy_by_name" );
+
+        var parentId = HandlerBase.GetString( args, "id" );
+
+        // If parent specified, only destroy direct children of that parent matching the name
+        string parentName = "scene";
+
+        if ( !string.IsNullOrEmpty( parentId ) && Guid.TryParse( parentId, out var pguid ) )
+        {
+            // Find parent using deep unfiltered search (handles map-spawned objects)
+            GameObject parent = FindGameObjectDeep( scene, pguid );
+            if ( parent == null )
+                return HandlerBase.Error( $"Parent '{parentId}' not found.", "destroy_by_name" );
+
+            parentName = parent.Name;
+            var toDestroy = parent.Children.Where( go => go.Name == name ).ToList();
+            foreach ( var go in toDestroy )
+                go.Destroy();
+
+            return HandlerBase.Confirm( $"Destroyed {toDestroy.Count} objects named '{name}' under '{parentName}'." );
+        }
+        else
+        {
+            // Search entire scene tree recursively
+            var toDestroy = new List<GameObject>();
+            CollectByName( scene.Children, name, toDestroy );
+            foreach ( var go in toDestroy )
+                go.Destroy();
+
+            return HandlerBase.Confirm( $"Destroyed {toDestroy.Count} objects named '{name}' in scene." );
+        }
+    }
+
+    // ── destroy_children ────────────────────────────────────────────
+
+    private static object DestroyChildren( JsonElement args )
+    {
+        var scene = SceneHelpers.ResolveScene();
+        if ( scene == null )
+            return HandlerBase.Error( "No active scene.", "destroy_children" );
+
+        var id = HandlerBase.GetString( args, "id" );
+        if ( string.IsNullOrEmpty( id ) )
+            return HandlerBase.Error( "Missing required 'id' parameter.", "destroy_children" );
+
+        if ( !Guid.TryParse( id, out var guid ) )
+            return HandlerBase.Error( $"Invalid GUID: '{id}'.", "destroy_children" );
+
+        // Find parent using deep unfiltered search (handles map-spawned objects)
+        GameObject parent = FindGameObjectDeep( scene, guid );
+        if ( parent == null )
+            return HandlerBase.Error( $"GameObject '{id}' not found in scene.", "destroy_children" );
+
+        var children = parent.Children.ToList();
+        int count = children.Count;
+        foreach ( var child in children )
+            child.Destroy();
+
+        return HandlerBase.Confirm( $"Destroyed {count} children of '{parent.Name}'." );
+    }
+
+    // ── helpers for deep search without FindById ─────────────────────
+
+    /// <summary>
+    /// Deep recursive search through go.Children directly, bypassing FindById.
+    /// Works for map-spawned objects that may not be found by other methods.
+    /// </summary>
+    private static GameObject FindGameObjectDeep( Scene scene, Guid guid )
+    {
+        // Strategy 1: Try scene.GetAllObjects which includes map-spawned objects
+        try
+        {
+            foreach ( var go in scene.GetAllObjects( true ) )
+                if ( go.Id == guid ) return go;
+        }
+        catch { }
+
+        // Strategy 2: Recursive walk through Children
+        foreach ( var root in scene.Children )
+        {
+            var result = FindInSubtreeDeep( root, guid );
+            if ( result != null ) return result;
+        }
+        return null;
+    }
+
+    private static GameObject FindInSubtreeDeep( GameObject go, Guid guid )
+    {
+        if ( go.Id == guid ) return go;
+        foreach ( var child in go.Children )
+        {
+            var result = FindInSubtreeDeep( child, guid );
+            if ( result != null ) return result;
+        }
+        return null;
+    }
+
+    /// <summary>
+    /// Recursively collects all objects with the given name from the scene tree.
+    /// </summary>
+    private static void CollectByName( IEnumerable<GameObject> objects, string name, List<GameObject> results )
+    {
+        foreach ( var go in objects )
+        {
+            if ( go.Name == name )
+                results.Add( go );
+            CollectByName( go.Children, name, results );
+        }
     }
 
     // ── duplicate ─────────────────────────────────────────────────────

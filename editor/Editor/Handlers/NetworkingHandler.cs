@@ -11,8 +11,43 @@ namespace Arenula;
 /// networking tool: add_helper, configure_object, get_status.
 /// Editor-time multiplayer setup: NetworkHelper, per-object network flags.
 /// </summary>
+[McpTool( "networking",
+    "Configure multiplayer networking in the editor. Use add_helper to place a NetworkHelper that creates lobbies and spawns player prefabs. Use configure_object to set per-object network flags, ownership transfer, orphan behavior, interpolation, and transmission policy. Use get_status to inspect one object or a paginated scene-wide network inventory. Mutating actions change scene state; inspect the target first when possible." )]
 internal static class NetworkingHandler
 {
+    [McpAction( "add_helper", WriteKind = "scene_write" )]
+    internal static object HandleAddHelper( JsonElement args ) => Handle( "add_helper", args );
+
+    [McpAction( "configure_object", WriteKind = "scene_write" )]
+    internal static object HandleConfigureObject( JsonElement args ) => Handle( "configure_object", args );
+
+    [McpAction( "get_status", ReadOnly = true )]
+    internal static object HandleGetStatus( JsonElement args ) => Handle( "get_status", args );
+
+    internal static object InputSchema() => new
+    {
+        type = "object",
+        properties = new Dictionary<string, object>
+        {
+            ["action"] = new { type = "string", description = "The operation to perform.", @enum = new[] { "add_helper", "configure_object", "get_status" } },
+            ["id"] = new { type = "string", description = "Target GameObject GUID. Required for configure_object; optional for add_helper and get_status." },
+            ["name"] = new { type = "string", description = "Object name. Used by add_helper." },
+            ["position"] = new { type = "string", description = "Position as 'x,y,z'. Used by add_helper." },
+            ["player_prefab"] = new { type = "string", description = "Player prefab path. Used by add_helper." },
+            ["spawn_point_ids"] = new { type = "string", description = "Comma-separated spawn point GUIDs. Used by add_helper." },
+            ["start_server"] = new { type = "boolean", description = "Create a server. Used by add_helper; default true." },
+            ["flags"] = new { type = "string", description = "Comma-separated flags: no_interpolation, no_position_sync, no_rotation_sync, no_scale_sync, no_transform_sync." },
+            ["owner_transfer"] = new { type = "string", description = "Ownership transfer: none, request, takeover." },
+            ["orphaned_mode"] = new { type = "string", description = "Orphan behavior: destroy, host, none." },
+            ["always_transmit"] = new { type = "boolean", description = "Always transmit updates. Used by configure_object." },
+            ["interpolation"] = new { type = "boolean", description = "Interpolate transforms. Used by configure_object." },
+            ["offset"] = new { type = "integer", description = "Pagination offset for scene-wide get_status; default 0." },
+            ["limit"] = new { type = "integer", description = "Maximum scene-wide get_status results; default 50." }
+        },
+        required = new[] { "action" },
+        additionalProperties = false
+    };
+
     internal static object Handle( string action, JsonElement args )
     {
         try

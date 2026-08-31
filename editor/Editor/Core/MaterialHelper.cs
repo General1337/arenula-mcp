@@ -6,6 +6,7 @@ namespace Arenula;
 /// <summary>
 /// Helper utilities for material loading and application operations on PolygonMesh.
 /// Provides centralized methods for material handling in mesh editing tools.
+/// Ported from Ozmium MaterialHelper.cs (202 lines).
 /// </summary>
 internal static class MaterialHelper
 {
@@ -59,20 +60,8 @@ internal static class MaterialHelper
         return ApplyMaterialToFace( mesh, faceIndex, material );
     }
 
-    /// <summary>
-    /// Set a face's texture projection parameters. Mirrors
-    /// <c>PolygonMesh.SetFaceTextureParameters</c> argument-for-argument on purpose:
-    /// the axes arrive already packed as Vector4, with the texture offset in the w
-    /// components (axisU.w -> offset.x, axisV.w -> offset.y).
-    ///
-    /// Do not "simplify" this to take Vector3 axes plus a separate Vector2 offset.
-    /// Vector2 and Vector3 convert into each other implicitly in s&amp;box, so that shape
-    /// lets a misordered call compile and silently write each value into the wrong slot
-    /// — which is exactly what happened here between 2026-04-04 and 2026-08-15. Vector3
-    /// -> Vector4 is explicit, so this signature rejects the same mistake at compile time.
-    /// </summary>
     internal static bool SetTextureParameters( PolygonMesh mesh, int faceIndex,
-        Vector4 axisU, Vector4 axisV, Vector2 scale )
+        Vector3 vAxisU, Vector3 vAxisV, Vector2 scale )
     {
         if ( mesh == null )
             return false;
@@ -81,7 +70,8 @@ internal static class MaterialHelper
             var faceHandle = mesh.FaceHandleFromIndex( faceIndex );
             if ( !faceHandle.IsValid )
                 return false;
-            mesh.SetFaceTextureParameters( faceHandle, axisU, axisV, scale );
+            mesh.SetFaceTextureParameters( faceHandle,
+                new Vector4( vAxisU, 0f ), new Vector4( vAxisV, 0f ), scale );
             return true;
         }
         catch

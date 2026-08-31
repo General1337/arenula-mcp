@@ -22,8 +22,16 @@ namespace Arenula;
 /// </summary>
 public static class ArenulaMcpServer
 {
+    internal const long MaxRequestSizeBytes = 8L * 1024L * 1024L;
+
     [ConVar( "mcp_server_port", ConVarFlags.Saved )]
     public static int Port { get; set; } = 8098;
+
+    [ConVar( "mcp_log_session_lifecycle", ConVarFlags.Saved )]
+    public static bool LogSessionLifecycle { get; set; } = false;
+
+    [ConVar( "mcp_log_disconnect_errors", ConVarFlags.Saved )]
+    public static bool LogDisconnectErrors { get; set; } = false;
 
     // ── GUI events & state ─────────────────────────────────────────────────
     public static event Action OnServerStateChanged;
@@ -31,18 +39,33 @@ public static class ArenulaMcpServer
     public static bool IsRunning   => _listener != null && _listener.IsListening;
     public static int  SessionCount => _sessions.Count;
 
-    /// <summary>Safely dispatches an action to the main thread, swallowing exceptions if the thread is gone (e.g. during cancel).</summary>
+    /// <summary>
+    /// Dispatches an action to the main thread, swallowing exceptions if the thread is gone (e.g.
+    /// during cancel). Fire-and-forget: the action has usually NOT run by the time this returns.
+    /// </summary>
+    /// <remarks>
+    /// Must hop via <c>GameTask.MainThread()</c>, never <c>GameTask.RunInThreadAsync()</c> — the
+    /// latter posts to <c>SyncContext.WorkerThread</c>. Subscribers of <see cref="OnLogMessage"/> and
+    /// <see cref="OnServerStateChanged"/> touch editor widgets, and every Qt widget constructor calls
+    /// <c>InteropSystem.Alloc</c>, which asserts the main thread.
+    /// </remarks>
     private static async void SafeRunOnMainThread( Action action )
     {
         try
         {
-            // GameTask.RunInThreadAsync runs on a WORKER thread — Qt widget updates
-            // from there silently no-op, which left the panel's Activity Log empty.
-            // MainThread() is the real hop (same pattern as RpcDispatcher).
             await GameTask.MainThread();
             action();
         }
         catch { /* Main thread unavailable (cancelled / disposed) – safe to ignore */ }
+    }
+
+    /// <summary>
+    /// Raises <see cref="OnLogMessage"/> on the main thread. Never invoke the event directly from a
+    /// request handler: those run on HTTP worker threads and subscribers build Qt widgets.
+    /// </summary>
+    internal static void RaiseLogMessage( string msg )
+    {
+        SafeRunOnMainThread( () => OnLogMessage?.Invoke( msg ) );
     }
 
     private static void LogInfo( string msg )
@@ -72,6 +95,38 @@ public static class ArenulaMcpServer
         } );
     }
 
+    private static void LogSessionLifecycleInfo( string msg )
+    {
+        if ( LogSessionLifecycle )
+            LogInfo( msg );
+        else
+            RaiseLogMessage( $"[TRACE] {msg}" );
+    }
+
+    private static void LogConnectionError( string prefix, Exception ex )
+    {
+        if ( IsExpectedClientDisconnect( ex ) && !LogDisconnectErrors )
+        {
+            RaiseLogMessage( $"[TRACE] {prefix}: {ex.Message}" );
+            return;
+        }
+
+        // Full exception, not just Message: a bare .Message discards the stack, which is the only
+        // thing that identifies which subscriber or handler actually threw.
+        LogError( $"{prefix}: {ex}" );
+    }
+
+    private static bool IsExpectedClientDisconnect( Exception ex )
+    {
+        var msg = ex.Message ?? "";
+        return ex is IOException
+            || ex is ObjectDisposedException
+            || msg.Contains( "nonexistent network connection", StringComparison.OrdinalIgnoreCase )
+            || msg.Contains( "forcibly closed", StringComparison.OrdinalIgnoreCase )
+            || msg.Contains( "broken pipe", StringComparison.OrdinalIgnoreCase )
+            || msg.Contains( "An existing connection was forcibly closed", StringComparison.OrdinalIgnoreCase );
+    }
+
     private static void NotifyStateChanged()
     {
         SafeRunOnMainThread( () => OnServerStateChanged?.Invoke() );
@@ -80,10 +135,25 @@ public static class ArenulaMcpServer
     // ── Internal state ─────────────────────────────────────────────────────
     private static HttpListener _listener;
     private static CancellationTokenSource _cts;
+    private static readonly TimeSpan BackgroundMaintenancePoll = TimeSpan.FromMilliseconds( 250 );
+    private static readonly TimeSpan BackgroundSweepInterval = TimeSpan.FromSeconds( 10 );
+    private static long _lastBackgroundMaintenanceTickUnixMs;
+    private static int _backgroundMaintenanceThreadId;
     private static readonly ConcurrentDictionary<string, McpSession> _sessions = new();
+    private static readonly HashSet<string> SupportedProtocolVersions = new( StringComparer.Ordinal )
+    {
+        "2025-11-25",
+        "2025-06-18",
+        "2025-03-26"
+    };
 
     // Tracks in-flight RPC tasks so StopServer can wait for them to finish
     private static readonly ConcurrentDictionary<Guid, Task> _inflightTasks = new();
+
+    internal static long LastBackgroundMaintenanceTickUnixMs =>
+        Volatile.Read( ref _lastBackgroundMaintenanceTickUnixMs );
+    internal static int BackgroundMaintenanceThreadId =>
+        Volatile.Read( ref _backgroundMaintenanceThreadId );
 
     internal static readonly JsonSerializerOptions JsonOptions = new()
     {
@@ -93,7 +163,10 @@ public static class ArenulaMcpServer
     };
 
     // ── Global log capture ────────────────────────────────────────────────
-    private static bool _loggerHooked;
+    //
+    // Deliberately no `_loggerHooked` flag: it was a static, a hot-reload reset it to false, and
+    // gating RemoveLogger on it leaked one OnGlobalLog registration per hotload. AddLogger/RemoveLogger
+    // are idempotent enough to call unconditionally, which is what EditorHandler already does.
 
     private static void OnGlobalLog( LogEvent e )
     {
@@ -111,22 +184,28 @@ public static class ArenulaMcpServer
     // ── Lifecycle ──────────────────────────────────────────────────────────
 
     /// <summary>
-    /// On hotload, tear the server down and rebind from scratch. This drops live SSE sessions
-    /// on every C# save, but it is the only variant verified to recover reliably.
-    ///
-    /// A keep-listener-alive variant (skip restart when the listener still reports IsListening,
-    /// respawn only the accept loop) was tried on 2026-07-11 and failed its in-editor gate:
-    /// on the second consecutive recompile the listener stayed dead for 6+ minutes and never
-    /// respawned — hotload can leave the old HttpListener zombified (IsListening true, nothing
-    /// accepting) or orphan it across an assembly reload, and no static check distinguishes
-    /// those states. Unconditional Stop+Start releases the port and rebinds fresh every time.
-    /// MCP clients reconnect on the next request; session loss is acceptable for a dev tool.
+    /// On hotload, stop the existing server (which retains its listener reference via
+    /// preserved static state) and restart it so new handler code is picked up.
     /// </summary>
     [EditorEvent.Hotload]
     public static void OnHotload()
     {
-        StopServer();
-        StartServer();
+        // 2026-04-21 — S&Box EditorEvent.Hotload contract requires handlers
+        // to swallow all exceptions. An unhandled throw here breaks the
+        // event dispatcher for every other subscriber on subsequent hotloads
+        // (silent editor-wide breakage — extremely hard to diagnose).
+        try
+        {
+            // Drop reflection records from the outgoing editor assembly before
+            // the restarted listener can accept a tools/list or tools/call.
+            McpToolScanner.Invalidate();
+            if ( IsRunning ) StopServer();
+            StartServer();
+        }
+        catch ( Exception ex )
+        {
+            LogError( $"OnHotload failed: {ex.Message}" );
+        }
     }
 
     public static void StartServer()
@@ -139,12 +218,21 @@ public static class ArenulaMcpServer
 
         try
         {
-            // Hook into the global editor log stream
-            if ( !_loggerHooked )
-            {
-                EditorUtility.AddLogger( OnGlobalLog );
-                _loggerHooked = true;
-            }
+            // A prior listener can fail independently of its maintenance task.
+            // Always retire any old cancellation epoch before publishing a new
+            // one, even when IsRunning was already false.
+            try { _cts?.Cancel(); } catch { }
+            Volatile.Write( ref _lastBackgroundMaintenanceTickUnixMs, 0 );
+            Volatile.Write( ref _backgroundMaintenanceThreadId, 0 );
+
+            // Hook into the global editor log stream. The RemoveLogger is unconditional and
+            // idempotent — same pattern as EditorHandler.EnsureInitialized, for the same reason.
+            // Guarding it behind a static flag leaked one surplus OnGlobalLog registration per
+            // hotload, so every engine log line fanned out N times into the MCP ring buffer.
+            // Measured at 7 live registrations on 2026-07-09 (vs 1 for OnEngineLog, which already
+            // removed unconditionally).
+            try { EditorUtility.RemoveLogger( OnGlobalLog ); } catch { }
+            EditorUtility.AddLogger( OnGlobalLog );
 
             _listener = new HttpListener();
             _listener.Prefixes.Add( $"http://localhost:{Port}/" );
@@ -152,19 +240,12 @@ public static class ArenulaMcpServer
             _listener.Start();
 
             _cts = new CancellationTokenSource();
-            _ = Task.Run( () => ListenLoop( _cts.Token ) );
+            var token = _cts.Token;
+            _ = Task.Run( () => ListenLoop( token ), token );
+            _ = Task.Run( () => BackgroundMaintenanceLoop( token ), token );
 
             LogInfo( $"Started Model Context Protocol Server on port {Port}" );
             NotifyStateChanged();
-
-            // Auto-regen the arenula-api schema cache if Sandbox.Engine.dll has changed
-            // since last build. Fire-and-forget; never blocks plugin boot. Degraded-mode
-            // if it fails — arenula-api falls back to the CDN.
-            _ = Task.Run( async () =>
-            {
-                try { await SchemaExporter.RegenerateIfStale(); }
-                catch ( Exception ex ) { LogError( $"schema regen task faulted: {ex.Message}" ); }
-            } );
         }
         catch ( Exception ex )
         {
@@ -176,21 +257,19 @@ public static class ArenulaMcpServer
     {
         try
         {
-            // Unhook the global logger
-            if ( _loggerHooked )
-            {
-                EditorUtility.RemoveLogger( OnGlobalLog );
-                _loggerHooked = false;
-            }
+            // Unhook the global logger. Unconditional — see the note at OnGlobalLog.
+            try { EditorUtility.RemoveLogger( OnGlobalLog ); } catch { }
 
             _cts?.Cancel();
+            Volatile.Write( ref _lastBackgroundMaintenanceTickUnixMs, 0 );
+            Volatile.Write( ref _backgroundMaintenanceThreadId, 0 );
 
             try { _listener?.Stop(); } catch { }
             try { _listener?.Close(); } catch { }
             _listener = null;
 
             // Don't wait for in-flight tasks — they may be blocked waiting for the
-            // main thread (GameTask.RunInThreadAsync) which would deadlock here.
+            // main thread (GameTask.MainThread) which would deadlock here.
             // Just clear the tracking dictionary; the tasks will see the cancelled token
             // and wind down on their own.
             _inflightTasks.Clear();
@@ -211,62 +290,535 @@ public static class ArenulaMcpServer
         }
     }
 
+    /// <summary>
+    /// Runs coordination maintenance away from <c>EditorEvent.Frame</c>.
+    /// Fence processing performs filesystem I/O and takes coordinator locks;
+    /// neither belongs on the synchronous editor UI/frame pump. The loop is
+    /// owned by the same cancellation token as the listener, so hotload and
+    /// explicit server shutdown retire the old worker before its replacement.
+    /// </summary>
+    private static async Task BackgroundMaintenanceLoop( CancellationToken token )
+    {
+        var nextSweepUtc = DateTime.MinValue;
+        string lastError = null;
+
+        while ( !token.IsCancellationRequested )
+        {
+            Volatile.Write( ref _backgroundMaintenanceThreadId,
+                Environment.CurrentManagedThreadId );
+            Volatile.Write( ref _lastBackgroundMaintenanceTickUnixMs,
+                DateTimeOffset.UtcNow.ToUnixTimeMilliseconds() );
+
+            try
+            {
+                McpOperationCoordinator.ProcessRuntimeFence();
+
+                var nowUtc = DateTime.UtcNow;
+                if ( nowUtc >= nextSweepUtc )
+                {
+                    McpOperationCoordinator.SweepZombies();
+                    GameObjectLockMap.ReapExpired();
+                    nextSweepUtc = nowUtc + BackgroundSweepInterval;
+                }
+
+                lastError = null;
+            }
+            catch ( Exception ex )
+            {
+                var error = ex.GetType().Name + ": " + ex.Message;
+                if ( !string.Equals( error, lastError, StringComparison.Ordinal ) )
+                {
+                    lastError = error;
+                    LogWarning( $"MCP background maintenance failed: {error}" );
+                }
+            }
+
+            try
+            {
+                await Task.Delay( BackgroundMaintenancePoll, token );
+            }
+            catch ( OperationCanceledException ) when ( token.IsCancellationRequested )
+            {
+                break;
+            }
+        }
+    }
+
     // ── HTTP listen loop ───────────────────────────────────────────────────
 
     private static async Task ListenLoop( CancellationToken token )
     {
-        while ( !token.IsCancellationRequested && _listener != null && _listener.IsListening )
+        while ( !token.IsCancellationRequested )
         {
+            var listener = _listener;
+            if ( listener == null || !listener.IsListening )
+                break;
+
             try
             {
-                var context = await _listener.GetContextAsync();
-                _ = Task.Run( () => HandleContext( context ), token );
+                var context = await listener.GetContextAsync();
+
+                // Observe the task's fault. Discarding it meant any exception escaping HandleContext
+                // went unobserved and was rethrown by the finalizer thread.
+                _ = Task.Run( () => HandleContext( context ), token )
+                    .ContinueWith(
+                        t => LogError( $"Unhandled MCP request failure: {t.Exception?.GetBaseException()}" ),
+                        CancellationToken.None,
+                        TaskContinuationOptions.OnlyOnFaulted,
+                        TaskScheduler.Default );
             }
-            catch ( Exception ex ) when ( ex is not ObjectDisposedException )
+            catch ( ObjectDisposedException ) when ( token.IsCancellationRequested || _listener == null )
+            {
+                break;
+            }
+            catch ( HttpListenerException ) when ( token.IsCancellationRequested || _listener == null )
+            {
+                break;
+            }
+            catch ( InvalidOperationException ) when ( token.IsCancellationRequested || _listener == null )
+            {
+                break;
+            }
+            catch ( Exception ex )
             {
                 LogError( $"Error in MCP listen loop: {ex.Message}" );
+                try { await Task.Delay( 100, token ); } catch { break; }
             }
         }
     }
 
     private static async Task HandleContext( HttpListenerContext context )
     {
-        // Top-level guard: this is invoked via `_ = Task.Run(...)` in ListenLoop, so any
-        // exception that escapes is unobserved and surfaces on the finalizer thread as
-        // "A Task's exception(s) were not observed". The most common path is
-        // ObjectDisposedException on res when the listener is torn down mid-request.
+        var req = context.Request;
+        var res = context.Response;
+
+        if ( !ValidateOrigin( req, res ) ) return;
+
+        var origin = req.Headers["Origin"];
+        res.Headers.Add( "Access-Control-Allow-Origin",
+            string.IsNullOrWhiteSpace( origin ) ? $"http://localhost:{Port}" : origin );
+        res.Headers.Add( "Access-Control-Allow-Methods", "GET, POST, OPTIONS" );
+        res.Headers.Add( "Access-Control-Allow-Headers", "*" );
+
+        if ( req.HttpMethod == "OPTIONS" ) { res.StatusCode = 200; res.Close(); return; }
+
         try
         {
-            var req = context.Request;
-            var res = context.Response;
-
-            res.Headers.Add( "Access-Control-Allow-Origin",  "*" );
-            res.Headers.Add( "Access-Control-Allow-Methods", "GET, POST, OPTIONS" );
-            res.Headers.Add( "Access-Control-Allow-Headers", "*" );
-
-            if ( req.HttpMethod == "OPTIONS" ) { res.StatusCode = 200; res.Close(); return; }
-
-            try
-            {
-                if      ( req.Url.AbsolutePath == "/sse"     && req.HttpMethod == "GET"  ) await HandleSse( req, res );
-                else if ( req.Url.AbsolutePath == "/message" && req.HttpMethod == "POST" ) await HandleMessage( req, res );
-                else    { res.StatusCode = 404; res.Close(); }
-            }
-            catch ( ObjectDisposedException )
-            {
-                // Listener/response torn down mid-request. Nothing to clean up safely.
-            }
-            catch ( Exception ex )
-            {
-                try { LogError( $"Error handling MCP request: {ex.Message}" ); } catch { }
-                // Response cleanup must itself be guarded — if the original exception
-                // came from a disposed response, these lines will re-throw.
-                try { res.StatusCode = 500; res.Close(); } catch { }
-            }
+            if      ( req.Url.AbsolutePath == "/sse"     && req.HttpMethod == "GET"  ) await HandleSse( req, res );
+            else if ( req.Url.AbsolutePath == "/message" && req.HttpMethod == "POST" ) await HandleMessage( req, res );
+            else if ( req.Url.AbsolutePath == "/mcp"     && req.HttpMethod == "GET"  ) await HandleMcpGet( req, res );
+            else if ( req.Url.AbsolutePath == "/mcp"     && req.HttpMethod == "POST" ) await HandleMcpPost( req, res );
+            else if ( req.Url.AbsolutePath.StartsWith( "/.well-known/" ) )             HandleWellKnown( req, res );
+            else    { res.StatusCode = 404; res.Close(); }
         }
         catch ( Exception ex )
         {
-            try { LogError( $"Unhandled error in MCP HandleContext: {ex.Message}" ); } catch { }
+            LogError( $"Error handling MCP request: {ex}" );
+
+            // The handler that threw may already have closed the response or sent its headers.
+            // Touching it here then throws OUT of this catch block — that is how a single handler
+            // fault used to escape HandleContext entirely and surface as a disposed-object warning.
+            try
+            {
+                res.StatusCode = 500;
+                res.Close();
+            }
+            catch { /* response already closed / headers sent */ }
+        }
+    }
+
+    internal static bool IsSupportedProtocolVersion( string version )
+    {
+        return string.IsNullOrWhiteSpace( version ) || SupportedProtocolVersions.Contains( version );
+    }
+
+    private static bool ValidateOrigin( HttpListenerRequest req, HttpListenerResponse res )
+    {
+        var origin = req.Headers["Origin"];
+        if ( string.IsNullOrWhiteSpace( origin ) )
+            return true;
+
+        if ( Uri.TryCreate( origin, UriKind.Absolute, out var uri ) && IsLoopbackHost( uri.Host ) )
+            return true;
+
+        res.StatusCode = 403;
+        res.ContentType = "application/json";
+        var json = JsonSerializer.Serialize( new
+        {
+            error = "forbidden_origin",
+            message = "Arenula MCP accepts HTTP requests only from missing Origin or loopback origins."
+        }, JsonOptions );
+        var buffer = Encoding.UTF8.GetBytes( json );
+        res.ContentLength64 = buffer.Length;
+        res.OutputStream.Write( buffer, 0, buffer.Length );
+        res.Close();
+        LogWarning( $"Rejected MCP request from non-loopback Origin '{origin}'." );
+        return false;
+    }
+
+    private static bool IsLoopbackHost( string host )
+    {
+        if ( string.IsNullOrWhiteSpace( host ) ) return false;
+        if ( string.Equals( host, "localhost", StringComparison.OrdinalIgnoreCase ) ) return true;
+        if ( IPAddress.TryParse( host, out var address ) ) return IPAddress.IsLoopback( address );
+        return false;
+    }
+
+    private static string ResolveProtocolVersion( HttpListenerRequest req, out string errorJson )
+    {
+        var version = req.Headers["MCP-Protocol-Version"];
+        if ( string.IsNullOrWhiteSpace( version ) )
+        {
+            errorJson = null;
+            return "2025-03-26";
+        }
+
+        if ( SupportedProtocolVersions.Contains( version ) )
+        {
+            errorJson = null;
+            return version;
+        }
+
+        errorJson = JsonSerializer.Serialize( new
+        {
+            jsonrpc = "2.0",
+            id = (object)null,
+            error = new
+            {
+                code = -32602,
+                message = $"Unsupported MCP-Protocol-Version '{version}'. Supported versions: {string.Join( ", ", SupportedProtocolVersions )}."
+            }
+        }, JsonOptions );
+        return null;
+    }
+
+    // ── OAuth metadata (tells clients no auth is required) ──────────────
+
+    private static void HandleWellKnown( HttpListenerRequest req, HttpListenerResponse res )
+    {
+        // MCP clients (e.g. Claude Code) probe /.well-known/oauth-protected-resource
+        // and /.well-known/oauth-authorization-server during OAuth discovery.
+        // Return a minimal valid JSON response so the client knows no auth is needed
+        // instead of 404 with empty body (which causes JSON parse errors).
+        string json;
+        if ( req.Url.AbsolutePath == "/.well-known/oauth-protected-resource" )
+        {
+            json = JsonSerializer.Serialize( new { resource = $"http://localhost:{Port}/" }, JsonOptions );
+        }
+        else
+        {
+            // Any other .well-known path — return 404 with valid JSON body
+            res.StatusCode = 404;
+            json = JsonSerializer.Serialize( new { error = "not_found" }, JsonOptions );
+        }
+
+        res.ContentType = "application/json";
+        var buffer = Encoding.UTF8.GetBytes( json );
+        res.ContentLength64 = buffer.Length;
+        res.OutputStream.Write( buffer, 0, buffer.Length );
+        res.Close();
+    }
+
+    private static async Task HandleMcpGet( HttpListenerRequest req, HttpListenerResponse res )
+    {
+        var accept = req.Headers["Accept"] ?? string.Empty;
+        if ( accept.Contains( "text/event-stream", StringComparison.OrdinalIgnoreCase ) )
+        {
+            await HandleMcpStream( req, res );
+            return;
+        }
+
+        var json = JsonSerializer.Serialize( new
+        {
+            name = "Arenula Editor",
+            version = ToolRegistry.Version,
+            transport = "streamable-http",
+            endpoint = "/mcp"
+        }, JsonOptions );
+
+        var buffer = Encoding.UTF8.GetBytes( json );
+        res.ContentType = "application/json";
+        res.ContentLength64 = buffer.Length;
+        await res.OutputStream.WriteAsync( buffer, 0, buffer.Length );
+        res.Close();
+    }
+
+    private static async Task HandleMcpPost( HttpListenerRequest req, HttpListenerResponse res )
+    {
+        var protocolVersion = ResolveProtocolVersion( req, out var protocolErrorJson );
+        if ( protocolVersion == null )
+        {
+            await WriteJsonResponse( res, 400, protocolErrorJson );
+            return;
+        }
+
+        var body = await ReadRequestBody( req );
+        if ( body == null )
+        {
+            await WritePayloadTooLargeResponse( res );
+            return;
+        }
+
+        try
+        {
+            using var doc = JsonDocument.Parse( body );
+            var root = doc.RootElement;
+            var sessionId = req.Headers["Mcp-Session-Id"] ?? req.QueryString["sessionId"] ?? Guid.NewGuid().ToString();
+            if ( root.ValueKind == JsonValueKind.Array )
+            {
+                var responses = new List<string>();
+                foreach ( var item in root.EnumerateArray() )
+                {
+                    var response = await HandleMcpRequestItem( item, sessionId, protocolVersion );
+                    if ( response != null )
+                    {
+                        responses.Add( response );
+                    }
+                }
+
+                if ( responses.Count == 0 )
+                {
+                    WriteAcceptedResponse( res, sessionId );
+                    return;
+                }
+
+                var batchJson = $"[{string.Join( ",", responses )}]";
+
+                await WriteJsonResponse( res, 200, batchJson, sessionId );
+                return;
+            }
+
+            var json = await HandleMcpRequestItem( root, sessionId, protocolVersion );
+            if ( json == null )
+            {
+                WriteAcceptedResponse( res, sessionId );
+                return;
+            }
+
+            await WriteJsonResponse( res, 200, json, sessionId );
+        }
+        catch ( Exception ex )
+        {
+            LogError( $"Error parsing streamable MCP JSON-RPC: {ex.Message}" );
+            var errorJson = JsonSerializer.Serialize( new
+            {
+                jsonrpc = "2.0",
+                id = (object)null,
+                error = new { code = -32700, message = $"Parse error: {ex.Message}" }
+            }, JsonOptions );
+            await WriteJsonResponse( res, 400, errorJson );
+        }
+    }
+
+    private static async Task<string> HandleMcpRequestItem( JsonElement item, string sessionId, string protocolVersion )
+    {
+        string method = item.TryGetProperty( "method", out var m ) ? m.GetString() : null;
+        object id = null;
+
+        if ( item.TryGetProperty( "id", out var idProp ) )
+        {
+            if      ( idProp.ValueKind == JsonValueKind.Number ) id = idProp.GetInt32();
+            else if ( idProp.ValueKind == JsonValueKind.String ) id = idProp.GetString();
+        }
+
+        if ( id == null )
+        {
+            if ( method != null && method.StartsWith( "notifications/", StringComparison.Ordinal ) )
+            {
+                if ( method == "notifications/initialized" )
+                {
+                    if ( _sessions.TryGetValue( sessionId, out var existing ) )
+                    {
+                        existing.Initialized = true;
+                    }
+                    LogInfo( $"MCP streamable session {sessionId} initialized." );
+                }
+
+                return null;
+            }
+
+            return JsonSerializer.Serialize( new
+            {
+                jsonrpc = "2.0",
+                id = (object)null,
+                error = new { code = -32600, message = "Invalid Request: missing id" }
+            }, JsonOptions );
+        }
+
+        if ( method == "initialize"
+             && item.TryGetProperty( "params", out var initParams )
+             && initParams.TryGetProperty( "protocolVersion", out var pv )
+             && pv.ValueKind == JsonValueKind.String
+             && !IsSupportedProtocolVersion( pv.GetString() ) )
+        {
+            return JsonSerializer.Serialize( new
+            {
+                jsonrpc = "2.0",
+                id,
+                error = new
+                {
+                    code = -32602,
+                    message = $"Unsupported initialize protocolVersion '{pv.GetString()}'. Supported versions: {string.Join( ", ", SupportedProtocolVersions )}."
+                }
+            }, JsonOptions );
+        }
+
+        var effectiveProtocol = protocolVersion;
+        if ( method == "initialize"
+             && item.TryGetProperty( "params", out var initParamsForSession )
+             && initParamsForSession.TryGetProperty( "protocolVersion", out var pvForSession )
+             && pvForSession.ValueKind == JsonValueKind.String
+             && IsSupportedProtocolVersion( pvForSession.GetString() ) )
+        {
+            effectiveProtocol = pvForSession.GetString();
+        }
+
+        var session = new McpSession
+        {
+            SessionId = sessionId,
+            Initialized = true,
+            ProtocolVersion = effectiveProtocol
+        };
+
+        return await RpcDispatcher.ProcessRpcRequestAndSerialize(
+            session, id, method, item.GetRawText(), JsonOptions, LogInfo, LogError );
+    }
+
+    private static async Task WriteJsonResponse( HttpListenerResponse res, int statusCode, string json, string sessionId = null )
+    {
+        var buffer = Encoding.UTF8.GetBytes( json );
+        res.StatusCode = statusCode;
+        res.ContentType = "application/json";
+        if ( !string.IsNullOrEmpty( sessionId ) )
+        {
+            res.Headers["MCP-Session-Id"] = sessionId;
+        }
+        res.ContentLength64 = buffer.Length;
+        await res.OutputStream.WriteAsync( buffer, 0, buffer.Length );
+        res.Close();
+    }
+
+    /// <summary>
+    /// Read one request body without allowing fixed-length or chunked clients to
+    /// allocate beyond <see cref="MaxRequestSizeBytes"/>. Content-Length is an
+    /// early rejection hint only; chunked requests report -1, so the stream itself
+    /// remains the authority.
+    /// </summary>
+    private static async Task<string> ReadRequestBody( HttpListenerRequest req )
+    {
+        if ( req.ContentLength64 > MaxRequestSizeBytes )
+            return null;
+
+        var initialCapacity = req.ContentLength64 is > 0 and <= MaxRequestSizeBytes
+            ? (int)req.ContentLength64
+            : 0;
+
+        using var buffer = initialCapacity > 0
+            ? new MemoryStream( initialCapacity )
+            : new MemoryStream();
+        var chunk = new byte[81920];
+
+        int read;
+        while ( (read = await req.InputStream.ReadAsync( chunk, 0, chunk.Length )) > 0 )
+        {
+            buffer.Write( chunk, 0, read );
+            if ( buffer.Length > MaxRequestSizeBytes )
+                return null;
+        }
+
+        return req.ContentEncoding.GetString( buffer.GetBuffer(), 0, (int)buffer.Length );
+    }
+
+    private static Task WritePayloadTooLargeResponse( HttpListenerResponse res )
+    {
+        var json = JsonSerializer.Serialize( new
+        {
+            error = "request_too_large",
+            message = $"MCP request body exceeds the {MaxRequestSizeBytes}-byte limit.",
+            max_bytes = MaxRequestSizeBytes
+        }, JsonOptions );
+        return WriteJsonResponse( res, (int)HttpStatusCode.RequestEntityTooLarge, json );
+    }
+
+    private static void WriteAcceptedResponse( HttpListenerResponse res, string sessionId = null )
+    {
+        res.StatusCode = 202;
+        if ( !string.IsNullOrEmpty( sessionId ) )
+        {
+            res.Headers["MCP-Session-Id"] = sessionId;
+        }
+        res.ContentLength64 = 0;
+        res.Close();
+    }
+
+    // ── Streamable HTTP event stream ──────────────────────────────────────
+
+    private static async Task HandleMcpStream( HttpListenerRequest req, HttpListenerResponse res )
+    {
+        var protocolVersion = ResolveProtocolVersion( req, out var protocolErrorJson );
+        if ( protocolVersion == null )
+        {
+            await WriteJsonResponse( res, 400, protocolErrorJson );
+            return;
+        }
+
+        var sessionId = req.Headers["Mcp-Session-Id"]
+                     ?? req.QueryString["sessionId"]
+                     ?? Guid.NewGuid().ToString();
+        var session = new McpSession
+        {
+            SessionId = sessionId,
+            SseResponse = res,
+            Initialized = true,
+            ProtocolVersion = protocolVersion
+        };
+        _sessions[sessionId] = session;
+
+        res.StatusCode = 200;
+        res.ContentType = "text/event-stream";
+        res.Headers.Add( "Cache-Control", "no-cache" );
+        res.Headers.Add( "Connection",    "keep-alive" );
+        res.Headers["MCP-Session-Id"] = sessionId;
+
+        try
+        {
+            // Streamable HTTP does not use the legacy SSE "endpoint" bootstrap event.
+            // A comment opens the stream without delivering a protocol message.
+            var connected = Encoding.UTF8.GetBytes( ": connected\n\n" );
+            await session.WriteLock.WaitAsync();
+            try
+            {
+                await res.OutputStream.WriteAsync( connected, 0, connected.Length );
+                await res.OutputStream.FlushAsync();
+            }
+            finally { session.WriteLock.Release(); }
+
+            LogSessionLifecycleInfo( $"Created MCP streamable HTTP session: {sessionId}" );
+            NotifyStateChanged();
+
+            while ( !_cts.IsCancellationRequested )
+            {
+                var done = await Task.WhenAny( session.Tcs.Task, Task.Delay( 30_000 ) );
+                if ( done == session.Tcs.Task || _cts.IsCancellationRequested ) break;
+                var ping = Encoding.UTF8.GetBytes( ": ping\n\n" );
+                await session.WriteLock.WaitAsync();
+                try
+                {
+                    await res.OutputStream.WriteAsync( ping, 0, ping.Length );
+                    await res.OutputStream.FlushAsync();
+                }
+                finally { session.WriteLock.Release(); }
+            }
+        }
+        catch ( Exception ex ) { LogConnectionError( "MCP streamable HTTP connection error", ex ); }
+        finally
+        {
+            // [HANDOFF-TRUST: engine-fork-phase3-1-library-mvp Phase 5 session-close lock release; Path C committed-design plumbing, independent of any inherited ranked hypothesis — Phase 1 already falsified the RFC editor-mutex-layer claim.]
+            _sessions.TryRemove( sessionId, out var closedSession );
+            ReleaseSessionLocks( sessionId, closedSession );
+            try { res.Close(); } catch { }
+            LogSessionLifecycleInfo( $"Closed MCP streamable HTTP session: {sessionId}" );
+            NotifyStateChanged();
         }
     }
 
@@ -294,7 +846,7 @@ public static class ArenulaMcpServer
             }
             finally { session.WriteLock.Release(); }
 
-            LogInfo( $"Created new MCP SSE session: {sessionId}" );
+            LogSessionLifecycleInfo( $"Created new MCP SSE session: {sessionId}" );
             NotifyStateChanged();
 
             // Ping every 30 s so we detect when the client disconnects
@@ -312,14 +864,14 @@ public static class ArenulaMcpServer
                 finally { session.WriteLock.Release(); }
             }
         }
-        // Client disconnects surface here as write/flush failures — routine (every hotload
-        // drops all sessions), so log as info rather than error.
-        catch ( Exception ex ) { LogInfo( $"SSE client disconnected: {ex.Message}" ); }
+        catch ( Exception ex ) { LogConnectionError( "SSE connection error", ex ); }
         finally
         {
-            _sessions.TryRemove( sessionId, out _ );
+            // [HANDOFF-TRUST: engine-fork-phase3-1-library-mvp Phase 5 session-close lock release; Path C committed-design plumbing, independent of any inherited ranked hypothesis — Phase 1 already falsified the RFC editor-mutex-layer claim.]
+            _sessions.TryRemove( sessionId, out var closedSession );
+            ReleaseSessionLocks( sessionId, closedSession );
             try { res.Close(); } catch { }
-            LogInfo( $"Closed MCP SSE session: {sessionId}" );
+            LogSessionLifecycleInfo( $"Closed MCP SSE session: {sessionId}" );
             NotifyStateChanged();
         }
     }
@@ -334,8 +886,12 @@ public static class ArenulaMcpServer
             res.StatusCode = 400; res.Close(); return;
         }
 
-        using var reader = new StreamReader( req.InputStream, Encoding.UTF8 );
-        var body = await reader.ReadToEndAsync();
+        var body = await ReadRequestBody( req );
+        if ( body == null )
+        {
+            await WritePayloadTooLargeResponse( res );
+            return;
+        }
 
         try
         {
@@ -397,6 +953,36 @@ public static class ArenulaMcpServer
         catch ( Exception ex )
         {
             LogError( $"Error parsing JSON-RPC: {ex.Message}" );
+        }
+    }
+
+    // ── Session lock release ──────────────────────────────────────────────
+
+    // [HANDOFF-TRUST: engine-fork-phase3-1-library-mvp Phase 5 — on SSE/streamable session close, evict the dropped agent's Coordinator operation leases and per-GameObject locks so a disconnected agent never strands cross-session contention state. Connection-drop is the PRIMARY lock-release signal per the Path C committed design. No inherited handoff hypothesis applies.]
+    /// <summary>Releases all MCP lock state owned by a closing session.</summary>
+    private static void ReleaseSessionLocks( string sessionId, McpSession session )
+    {
+        if ( string.IsNullOrEmpty( sessionId ) ) return;
+        try
+        {
+            var evicted = McpOperationCoordinator.EvictBySession( sessionId );
+            var released = 0;
+            if ( session?.AgentId is { Length: > 0 } agentId )
+            {
+                released = GameObjectLockMap.ReleaseAll( agentId );
+                // engine-fork-elite-leverage Phase 3.3 — flag the dropped agent's
+                // scratch container for lazy reaping. In-memory ONLY: GameObject
+                // .DestroyImmediate requires the MainThread and this SSE-close
+                // path is not guaranteed to be on it. The actual destroy happens
+                // on the next MainThread pool op (plan.md §3.2 / §4).
+                ScratchScenePool.MarkForReap( agentId );
+            }
+            if ( evicted > 0 || released > 0 )
+                LogInfo( $"Session {sessionId[..Math.Min( 8, sessionId.Length )]} close: evicted {evicted} operation lease(s), released {released} GameObject lock(s)." );
+        }
+        catch ( Exception ex )
+        {
+            LogError( $"ReleaseSessionLocks failed for session {sessionId}: {ex.Message}" );
         }
     }
 

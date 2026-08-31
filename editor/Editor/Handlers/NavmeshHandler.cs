@@ -10,6 +10,7 @@ namespace Arenula;
 
 /// <summary>
 /// navmesh tool: create_agent, create_area, create_link, generate, get_status, query_path.
+/// Ported from NavigationToolHandlers.cs (200 lines).
 /// NEW actions: generate, get_status, query_path — research required.
 /// </summary>
 internal static class NavmeshHandler
@@ -20,17 +21,17 @@ internal static class NavmeshHandler
         {
             return action switch
             {
-                "create_agent"         => CreateAgent( args ),
-                "create_area"          => CreateArea( args ),
-                "create_link"          => CreateLink( args ),
-                "generate"             => Generate( args ),
-                "generate_tile"        => GenerateTile( args ),
-                "unload_tile"          => UnloadTile( args ),
-                "set_defer_generation" => SetDeferGeneration( args ),
-                "get_status"           => GetStatus( args ),
-                "query_path"           => QueryPath( args ),
+                "create_agent" => CreateAgent( args ),
+                "create_area"  => CreateArea( args ),
+                "create_link"  => CreateLink( args ),
+                "generate"     => Generate( args ),
+                "get_status"   => GetStatus( args ),
+                "query_path"   => QueryPath( args ),
+                "generate_tile"         => GenerateTile( args ),
+                "unload_tile"           => UnloadTile( args ),
+                "set_defer_generation"  => SetDeferGeneration( args ),
                 _ => HandlerBase.Error( $"Unknown action '{action}'", action,
-                    "Valid actions: create_agent, create_area, create_link, generate, generate_tile, unload_tile, set_defer_generation, get_status, query_path" )
+                    "Valid actions: create_agent, create_area, create_link, generate, get_status, query_path, generate_tile, unload_tile, set_defer_generation" )
             };
         }
         catch ( Exception ex )
@@ -40,10 +41,13 @@ internal static class NavmeshHandler
     }
 
     // ── create_agent ──────────────────────────────────────────────────
+    // Ported from NavigationToolHandlers.CreateNavMeshAgent
 
     private static object CreateAgent( JsonElement args )
     {
-        var scene = HandlerBase.RequireScene( "create_agent" );
+        var scene = SceneHelpers.ResolveScene();
+        if ( scene == null )
+            return HandlerBase.Error( "No active scene.", "create_agent" );
 
         // Can add to existing GO (via id) or create a new one
         var id = HandlerBase.GetString( args, "id" );
@@ -63,12 +67,20 @@ internal static class NavmeshHandler
 
         var agent = go.Components.Create<NavMeshAgent>();
 
-        if ( HandlerBase.TryGetFloat( args, "height", out var h ) ) agent.Height = h;
-        if ( HandlerBase.TryGetFloat( args, "radius", out var r ) ) agent.Radius = r;
-        if ( HandlerBase.TryGetFloat( args, "speed", out var s ) ) agent.MaxSpeed = s;
-        if ( HandlerBase.TryGetFloat( args, "acceleration", out var a ) ) agent.Acceleration = a;
-        if ( HandlerBase.TryGetBool( args, "update_position", out var up ) ) agent.UpdatePosition = up;
-        if ( HandlerBase.TryGetBool( args, "update_rotation", out var ur ) ) agent.UpdateRotation = ur;
+        if ( args.TryGetProperty( "height", out var hEl ) && hEl.ValueKind == JsonValueKind.Number )
+            agent.Height = hEl.GetSingle();
+        if ( args.TryGetProperty( "radius", out var rEl ) && rEl.ValueKind == JsonValueKind.Number )
+            agent.Radius = rEl.GetSingle();
+        if ( args.TryGetProperty( "speed", out var sEl ) && sEl.ValueKind == JsonValueKind.Number )
+            agent.MaxSpeed = sEl.GetSingle();
+        if ( args.TryGetProperty( "acceleration", out var aEl ) && aEl.ValueKind == JsonValueKind.Number )
+            agent.Acceleration = aEl.GetSingle();
+        if ( args.TryGetProperty( "update_position", out var upEl ) &&
+             ( upEl.ValueKind == JsonValueKind.True || upEl.ValueKind == JsonValueKind.False ) )
+            agent.UpdatePosition = upEl.GetBoolean();
+        if ( args.TryGetProperty( "update_rotation", out var urEl ) &&
+             ( urEl.ValueKind == JsonValueKind.True || urEl.ValueKind == JsonValueKind.False ) )
+            agent.UpdateRotation = urEl.GetBoolean();
 
         return HandlerBase.Success( new
         {
@@ -81,15 +93,20 @@ internal static class NavmeshHandler
     }
 
     // ── create_area ───────────────────────────────────────────────────
+    // Ported from NavigationToolHandlers.CreateNavMeshArea
 
     private static object CreateArea( JsonElement args )
     {
-        var scene = HandlerBase.RequireScene( "create_area" );
+        var scene = SceneHelpers.ResolveScene();
+        if ( scene == null )
+            return HandlerBase.Error( "No active scene.", "create_area" );
 
         var posStr = HandlerBase.GetString( args, "position" );
         var position = posStr != null ? HandlerBase.ParseVector3( posStr ) : Vector3.Zero;
 
-        var go = SceneHelpers.CreateChildObject( scene, args, "NavMesh Area", position );
+        var go = scene.CreateObject();
+        go.Name = HandlerBase.GetString( args, "name" ) ?? "NavMesh Area";
+        go.WorldPosition = position;
 
         var area = go.Components.Create<NavMeshArea>();
         area.IsBlocker = HandlerBase.GetBool( args, "is_blocker", true );
@@ -112,10 +129,13 @@ internal static class NavmeshHandler
     }
 
     // ── create_link ───────────────────────────────────────────────────
+    // Ported from NavigationToolHandlers.CreateNavMeshLink
 
     private static object CreateLink( JsonElement args )
     {
-        var scene = HandlerBase.RequireScene( "create_link" );
+        var scene = SceneHelpers.ResolveScene();
+        if ( scene == null )
+            return HandlerBase.Error( "No active scene.", "create_link" );
 
         var startStr = HandlerBase.GetString( args, "start_position" );
         var endStr = HandlerBase.GetString( args, "end_position" );
@@ -129,13 +149,17 @@ internal static class NavmeshHandler
         // Place the GO at the midpoint
         var midpoint = ( startPos + endPos ) / 2f;
 
-        var go = SceneHelpers.CreateChildObject( scene, args, "NavMesh Link", midpoint );
+        var go = scene.CreateObject();
+        go.Name = HandlerBase.GetString( args, "name" ) ?? "NavMesh Link";
+        go.WorldPosition = midpoint;
 
         var link = go.Components.Create<NavMeshLink>();
         link.LocalStartPosition = startPos - midpoint;
         link.LocalEndPosition = endPos - midpoint;
 
-        if ( HandlerBase.TryGetBool( args, "bidirectional", out var bd ) ) link.IsBiDirectional = bd;
+        if ( args.TryGetProperty( "bidirectional", out var bdEl ) &&
+             ( bdEl.ValueKind == JsonValueKind.True || bdEl.ValueKind == JsonValueKind.False ) )
+            link.IsBiDirectional = bdEl.GetBoolean();
 
         return HandlerBase.Success( new
         {
@@ -155,7 +179,9 @@ internal static class NavmeshHandler
 
     private static object Generate( JsonElement args )
     {
-        var scene = HandlerBase.RequireScene( "generate" );
+        var scene = SceneHelpers.ResolveScene();
+        if ( scene == null )
+            return HandlerBase.Error( "No active scene.", "generate" );
 
         try
         {
@@ -181,7 +207,9 @@ internal static class NavmeshHandler
 
     private static object GetStatus( JsonElement args )
     {
-        var scene = HandlerBase.RequireScene( "get_status" );
+        var scene = SceneHelpers.ResolveScene();
+        if ( scene == null )
+            return HandlerBase.Error( "No active scene.", "get_status" );
 
         var agents = SceneHelpers.WalkAll( scene )
             .SelectMany( go => go.Components.GetAll().OfType<NavMeshAgent>() )
@@ -195,16 +223,11 @@ internal static class NavmeshHandler
             .SelectMany( go => go.Components.GetAll().OfType<NavMeshLink>() )
             .ToList();
 
-        var navMesh = scene.NavMesh;
-
         return HandlerBase.Success( new
         {
             agent_count = agents.Count,
             area_count = areas.Count,
             link_count = links.Count,
-            is_generating = navMesh?.IsGenerating ?? false,
-            is_dirty = navMesh?.IsDirty ?? false,
-            defer_generation = navMesh?.DeferGeneration ?? false,
             agents = agents.Select( a => new
             {
                 id = a.GameObject.Id.ToString(),
@@ -215,94 +238,15 @@ internal static class NavmeshHandler
         } );
     }
 
-    // ── generate_tile ────────────────────────────────────────────────
-    // NEW 26.04.15 — on-demand tile generation at a world position or bounds.
-
-    private static object GenerateTile( JsonElement args )
-    {
-        var scene = HandlerBase.RequireScene( "generate_tile" );
-
-        var navMesh = scene.NavMesh;
-        if ( navMesh == null )
-            return HandlerBase.Error( "No NavMesh component in the scene.", "generate_tile" );
-
-        var posStr = HandlerBase.GetString( args, "position" );
-        var minStr = HandlerBase.GetString( args, "bounds_min" );
-        var maxStr = HandlerBase.GetString( args, "bounds_max" );
-
-        if ( !string.IsNullOrEmpty( minStr ) && !string.IsNullOrEmpty( maxStr ) )
-        {
-            var min = HandlerBase.ParseVector3( minStr );
-            var max = HandlerBase.ParseVector3( maxStr );
-            var bounds = new BBox( min, max );
-            navMesh.RequestTilesGeneration( bounds );
-            return HandlerBase.Confirm( $"Queued navmesh tile generation for bounds ({min} → {max})." );
-        }
-
-        if ( string.IsNullOrEmpty( posStr ) )
-            return HandlerBase.Error( "Provide 'position' (x,y,z) or 'bounds_min'+'bounds_max' for the tiles to generate.", "generate_tile" );
-
-        var position = HandlerBase.ParseVector3( posStr );
-        navMesh.RequestTileGeneration( position );
-        return HandlerBase.Confirm( $"Queued navmesh tile generation at {position}." );
-    }
-
-    // ── unload_tile ──────────────────────────────────────────────────
-    // NEW 26.04.15 — remove navmesh tiles at a position or bounds.
-
-    private static object UnloadTile( JsonElement args )
-    {
-        var scene = HandlerBase.RequireScene( "unload_tile" );
-
-        var navMesh = scene.NavMesh;
-        if ( navMesh == null )
-            return HandlerBase.Error( "No NavMesh component in the scene.", "unload_tile" );
-
-        var posStr = HandlerBase.GetString( args, "position" );
-        var minStr = HandlerBase.GetString( args, "bounds_min" );
-        var maxStr = HandlerBase.GetString( args, "bounds_max" );
-
-        if ( !string.IsNullOrEmpty( minStr ) && !string.IsNullOrEmpty( maxStr ) )
-        {
-            var min = HandlerBase.ParseVector3( minStr );
-            var max = HandlerBase.ParseVector3( maxStr );
-            var bounds = new BBox( min, max );
-            navMesh.UnloadTiles( bounds );
-            return HandlerBase.Confirm( $"Unloaded navmesh tiles in bounds ({min} → {max})." );
-        }
-
-        if ( string.IsNullOrEmpty( posStr ) )
-            return HandlerBase.Error( "Provide 'position' (x,y,z) or 'bounds_min'+'bounds_max' for the tiles to unload.", "unload_tile" );
-
-        var position = HandlerBase.ParseVector3( posStr );
-        navMesh.UnloadTile( position );
-        return HandlerBase.Confirm( $"Unloaded navmesh tile at {position}." );
-    }
-
-    // ── set_defer_generation ─────────────────────────────────────────
-    // NEW 26.04.15 — toggle deferred navmesh generation for open-world games.
-
-    private static object SetDeferGeneration( JsonElement args )
-    {
-        var scene = HandlerBase.RequireScene( "set_defer_generation" );
-
-        var navMesh = scene.NavMesh;
-        if ( navMesh == null )
-            return HandlerBase.Error( "No NavMesh component in the scene.", "set_defer_generation" );
-
-        var enabled = HandlerBase.GetBool( args, "enabled", true );
-        navMesh.DeferGeneration = enabled;
-
-        return HandlerBase.Confirm( $"NavMesh DeferGeneration set to {enabled}. Tiles {( enabled ? "will NOT auto-generate on load — use generate_tile to generate on demand" : "will auto-generate on scene load" )}." );
-    }
-
     // ── query_path ────────────────────────────────────────────────────
     // NEW — pathfind between two points.
     // Research: Use NavMesh.GetPath() or NavMesh.PathBuilder.
 
     private static object QueryPath( JsonElement args )
     {
-        var scene = HandlerBase.RequireScene( "query_path" );
+        var scene = SceneHelpers.ResolveScene();
+        if ( scene == null )
+            return HandlerBase.Error( "No active scene.", "query_path" );
 
         var fromStr = HandlerBase.GetString( args, "from" );
         var toStr = HandlerBase.GetString( args, "to" );
@@ -350,5 +294,117 @@ internal static class NavmeshHandler
         {
             return HandlerBase.Error( $"Path query failed: {ex.Message}", "query_path" );
         }
+    }
+
+    // ── Per-tile generation ───────────────────────────────────────────
+    //
+    // Ported from upstream Arenula 087f048 (2026-08-05). Whole-navmesh
+    // 'generate' rebuilds everything, which is minutes on a large scene. These
+    // three let you regenerate only the region you changed, and to turn off
+    // generate-on-load entirely so a scene opens fast and you build tiles on
+    // demand. All use the Request* (fire-and-forget, incremental over frames)
+    // variants rather than the Task-returning ones, so no call blocks the editor.
+
+    private static object GenerateTile( JsonElement args )
+    {
+        var navMesh = RequireNavMesh( "generate_tile", out var error );
+        if ( navMesh == null ) return error;
+
+        if ( TryGetBounds( args, out var bounds ) )
+        {
+            navMesh.RequestTilesGeneration( bounds );
+            return HandlerBase.Confirm(
+                $"Queued navmesh tile generation for bounds ({bounds.Mins} → {bounds.Maxs}). " +
+                "Generation is incremental over subsequent frames — poll get_status for is_generating." );
+        }
+
+        var posStr = HandlerBase.GetString( args, "position" );
+        if ( string.IsNullOrEmpty( posStr ) )
+            return HandlerBase.Error(
+                "Provide 'position' (x,y,z) or both 'bounds_min' and 'bounds_max' for the tiles to generate.",
+                "generate_tile" );
+
+        var position = HandlerBase.ParseVector3( posStr );
+        navMesh.RequestTileGeneration( position );
+        return HandlerBase.Confirm(
+            $"Queued navmesh tile generation at {position}. " +
+            "Generation is incremental over subsequent frames — poll get_status for is_generating." );
+    }
+
+    private static object UnloadTile( JsonElement args )
+    {
+        var navMesh = RequireNavMesh( "unload_tile", out var error );
+        if ( navMesh == null ) return error;
+
+        if ( TryGetBounds( args, out var bounds ) )
+        {
+            navMesh.UnloadTiles( bounds );
+            return HandlerBase.Confirm( $"Unloaded navmesh tiles in bounds ({bounds.Mins} → {bounds.Maxs})." );
+        }
+
+        var posStr = HandlerBase.GetString( args, "position" );
+        if ( string.IsNullOrEmpty( posStr ) )
+            return HandlerBase.Error(
+                "Provide 'position' (x,y,z) or both 'bounds_min' and 'bounds_max' for the tiles to unload.",
+                "unload_tile" );
+
+        var position = HandlerBase.ParseVector3( posStr );
+        navMesh.UnloadTile( position );
+        return HandlerBase.Confirm( $"Unloaded navmesh tile at {position}." );
+    }
+
+    private static object SetDeferGeneration( JsonElement args )
+    {
+        var navMesh = RequireNavMesh( "set_defer_generation", out var error );
+        if ( navMesh == null ) return error;
+
+        if ( !HandlerBase.TryGetBool( args, "enabled", out var enabled ) )
+            return HandlerBase.Error(
+                "Missing required 'enabled' parameter (true or false).", "set_defer_generation" );
+
+        navMesh.DeferGeneration = enabled;
+
+        return HandlerBase.Confirm( enabled
+            ? "NavMesh DeferGeneration is ON — tiles will NOT auto-generate on scene load. Build them on demand with generate_tile."
+            : "NavMesh DeferGeneration is OFF — tiles auto-generate on scene load." );
+    }
+
+    // ── Shared helpers for the tile actions ───────────────────────────
+
+    /// <summary>
+    /// Resolve the scene's NavMesh, or hand back the error response to return.
+    /// Returns null when unavailable, with <paramref name="error"/> set.
+    /// </summary>
+    private static Sandbox.Navigation.NavMesh RequireNavMesh( string action, out object error )
+    {
+        error = null;
+        var scene = SceneHelpers.ResolveScene();
+        if ( scene == null )
+        {
+            error = HandlerBase.Error( "No active scene.", action );
+            return null;
+        }
+
+        var navMesh = scene.NavMesh;
+        if ( navMesh == null )
+        {
+            error = HandlerBase.Error( "No NavMesh in the scene.", action,
+                "Add a NavMesh to the scene, or run navmesh.generate first." );
+            return null;
+        }
+
+        return navMesh;
+    }
+
+    /// <summary>True when the caller supplied BOTH bounds corners.</summary>
+    private static bool TryGetBounds( JsonElement args, out BBox bounds )
+    {
+        bounds = default;
+        var minStr = HandlerBase.GetString( args, "bounds_min" );
+        var maxStr = HandlerBase.GetString( args, "bounds_max" );
+        if ( string.IsNullOrEmpty( minStr ) || string.IsNullOrEmpty( maxStr ) ) return false;
+
+        bounds = new BBox( HandlerBase.ParseVector3( minStr ), HandlerBase.ParseVector3( maxStr ) );
+        return true;
     }
 }

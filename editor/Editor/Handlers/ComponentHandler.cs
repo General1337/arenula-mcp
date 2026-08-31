@@ -9,6 +9,7 @@ namespace Arenula;
 
 /// <summary>
 /// component tool: add, remove, set_property, set_enabled, get_properties, get_types, copy.
+/// Ported from Ozmium OzmiumWriteHandlers, OzmiumAssetHandlers, UtilityToolHandlers.
 /// </summary>
 internal static class ComponentHandler
 {
@@ -25,8 +26,10 @@ internal static class ComponentHandler
                 "get_properties" => GetProperties( args ),
                 "get_types"      => GetTypes( args ),
                 "copy"           => Copy( args ),
+                "bulk_set"       => BulkSet( args, "bulk_set" ),
+                "apply_properties" => BulkSet( args, "apply_properties" ),
                 _ => HandlerBase.Error( $"Unknown action '{action}' for tool 'component'.", action,
-                    "Valid actions: add, remove, set_property, set_enabled, get_properties, get_types, copy" )
+                    "Valid actions: add, remove, set_property, set_enabled, get_properties, get_types, copy, bulk_set, apply_properties" )
             };
         }
         catch ( Exception ex )
@@ -70,8 +73,9 @@ internal static class ComponentHandler
     /// <summary>
     /// Fast component type lookup using TypeLibrary (indexed).
     /// Prefers game-assembly types over Sandbox built-ins when names collide.
+    /// Ported from OzmiumWriteHandlers.FindComponentTypeDescription.
     /// </summary>
-    private static TypeDescription FindComponentTypeDescription( string typeName )
+    internal static TypeDescription FindComponentTypeDescription( string typeName )
     {
         TypeDescription fallback = null;
         foreach ( var candidate in TypeLibrary.GetTypes<Component>() )
@@ -102,7 +106,9 @@ internal static class ComponentHandler
 
     private static object Add( JsonElement args )
     {
-        var scene = HandlerBase.RequireScene( "add" );
+        var scene = SceneHelpers.ResolveScene();
+        if ( scene == null )
+            return HandlerBase.Error( "No active scene.", "add" );
 
         var id = HandlerBase.GetString( args, "id" );
         if ( string.IsNullOrEmpty( id ) )
@@ -133,27 +139,15 @@ internal static class ComponentHandler
 
         var comp = go.Components.Create( td );
 
-        // Post-condition: confirm component actually landed on the GameObject.
-        var verifiedComp = go.Components.GetAll().FirstOrDefault( c => c.Id == comp.Id );
-        if ( verifiedComp == null )
-            return HandlerBase.Error(
-                $"Component '{td.Name}' reported added but not found on '{go.Name}' after verification. " +
-                "Engine-level silent drop.",
-                "add",
-                "Check 'editor.get_log' for related engine warnings." );
-
         return HandlerBase.Success( new
         {
             id = go.Id.ToString(),
             name = go.Name,
+            handle = SceneHelpers.BuildHandle( go ),
             component_id = comp.Id.ToString(),
             component_type = comp.GetType().Name,
-            message = $"Added '{td.Name}' to '{go.Name}'.",
-            verified = new
-            {
-                component_exists = true,
-                component_type = verifiedComp.GetType().Name
-            }
+            component_handle = SceneHelpers.BuildHandle( comp ),
+            message = $"Added '{td.Name}' to '{go.Name}'."
         } );
     }
 
@@ -161,7 +155,9 @@ internal static class ComponentHandler
 
     private static object Remove( JsonElement args )
     {
-        var scene = HandlerBase.RequireScene( "remove" );
+        var scene = SceneHelpers.ResolveScene();
+        if ( scene == null )
+            return HandlerBase.Error( "No active scene.", "remove" );
 
         var id = HandlerBase.GetString( args, "id" );
         if ( string.IsNullOrEmpty( id ) )
@@ -175,31 +171,18 @@ internal static class ComponentHandler
         var comp = FindComponentByIdOrThrow( go, componentId, "remove" );
 
         var typeName = comp.GetType().Name;
-        var compGuid = comp.Id;
         comp.Destroy();
 
-        // Post-condition: component should NOT be on GameObject after remove.
-        var stillPresent = go.Components.GetAll().Any( c => c.Id == compGuid );
-        if ( stillPresent )
-            return HandlerBase.Error(
-                $"Component reported removed but still present on '{go.Name}' after verification.",
-                "remove",
-                "Engine-level silent retention." );
-
-        return HandlerBase.Success( new
-        {
-            id = go.Id.ToString(),
-            name = go.Name,
-            message = $"Removed '{typeName}' from '{go.Name}'.",
-            verified = new { component_removed = true }
-        } );
+        return HandlerBase.Confirm( $"Removed '{typeName}' from '{go.Name}'." );
     }
 
     // ── set_property ─────────────────────────────────────────────────
 
     private static object SetProperty( JsonElement args )
     {
-        var scene = HandlerBase.RequireScene( "set_property" );
+        var scene = SceneHelpers.ResolveScene();
+        if ( scene == null )
+            return HandlerBase.Error( "No active scene.", "set_property" );
 
         var id = HandlerBase.GetString( args, "id" );
         if ( string.IsNullOrEmpty( id ) )
@@ -227,163 +210,88 @@ internal static class ComponentHandler
             return HandlerBase.Error( $"Property '{propName}' is read-only.", "set_property" );
 
         object converted = ConvertJsonValue( valEl, prop.PropertyType );
+
+        // Post-condition guard (upstream 8fe43bd, extended). A reference-valued
+        // conversion that did not actually resolve must not be written and then
+        // reported as success — that is the silent-no-op class, where the caller
+        // believes a write landed that never did.
+        //
+        // Two distinct failure shapes, both covered by UnresolvedReason:
+        //   - null: GameResource lookups and Component / GameObject GUID lookups.
+        //   - a placeholder: Model.Load hands back the error model for a bad path
+        //     rather than null, so a null check alone misses every bad .vmdl.
+        var unresolved = UnresolvedReason( converted, prop.PropertyType );
+        if ( unresolved != null && !IsExplicitNullRequest( valEl ) )
+            return HandlerBase.Error(
+                $"Could not resolve a {SchemaHelpers.FormatTypeName( prop.PropertyType )} for " +
+                $"'{comp.GetType().Name}.{propName}' ({unresolved}) — the property was NOT written.",
+                "set_property",
+                "Check the asset path or GUID exists. Asset paths are relative to Assets/ " +
+                "(no 'Assets/' prefix); GUIDs change on scene reload, so refresh with scene.summary. " +
+                "Pass the string \"null\" if clearing the property really is what you want.",
+                new { property = propName, requested = valEl.ToString() },
+                McpErrorCode.NotFound );
+
         prop.SetValue( comp, converted );
         var readback = prop.GetValue( comp );
-
-        // Post-condition: for resource-valued properties, read back and confirm non-null.
-        // Check by PROPERTY TYPE (not read-back value) so we can detect null-after-set.
-        object verifiedPayload;
-
-        var propType = prop.PropertyType;
-        bool isResourceType = typeof( GameResource ).IsAssignableFrom( propType )
-                              || propType == typeof( Model )
-                              || propType == typeof( Material );
-
-        if ( isResourceType )
-        {
-            // Distinguish "user wanted null" from "lookup failed and returned null".
-            // Caller may legitimately clear a resource property (e.g.
-            // MaterialOverride → null restores the model's default material)
-            // by passing JSON null, an empty string, or the literal "null".
-            // Without this guard, the post-condition fires on every successful clear.
-            bool intentionalNull =
-                valEl.ValueKind == JsonValueKind.Null ||
-                ( valEl.ValueKind == JsonValueKind.String &&
-                  ( string.IsNullOrEmpty( valEl.GetString() ) ||
-                    valEl.GetString() == "null" ) );
-
-            if ( readback == null && !intentionalNull )
-                return HandlerBase.Error(
-                    $"Property '{propName}' on {comp.GetType().Name} was set to '{valEl}' but read back as null. " +
-                    "Resource lookup likely failed — check that the asset is under 'Assets/' and indexed.",
-                    "set_property",
-                    "Use 'asset_query.get_status' to verify the asset is indexed." );
-
-            verifiedPayload = readback switch
-            {
-                null            => new { cleared = true } as object,
-                GameResource gr => new { asset_name = gr.ResourceName, asset_path = gr.ResourcePath } as object,
-                Model mdl       => new { model_path = mdl.ResourcePath } as object,
-                Material mat    => new { material_path = mat.ResourcePath } as object,
-                _               => readback.ToString()
-            };
-        }
-        else
-        {
-            // Scalar or non-resource — include formatted value for transparency.
-            verifiedPayload = FormatReadback( readback );
-        }
 
         return HandlerBase.Success( new
         {
             id = go.Id.ToString(),
             name = go.Name,
+            handle = SceneHelpers.BuildHandle( go ),
             component_type = comp.GetType().Name,
+            component_handle = SceneHelpers.BuildHandle( comp ),
             property = propName,
-            value = FormatReadback( readback ),
-            message = $"Set '{comp.GetType().Name}.{propName}' = {FormatReadback( readback )}",
-            verified = verifiedPayload
+            value = SchemaHelpers.FormatValue( readback ),
+            value_schema = SchemaHelpers.DescribeType( prop.PropertyType ),
+            message = $"Set '{comp.GetType().Name}.{propName}' = {readback}"
         } );
     }
 
-    // Render readback of complex wrapper structs in a way that surfaces the
-    // actual values, not the type name. Default ToString on these structs
-    // returns "Sandbox.ParticleFloat" which makes set_property responses
-    // useless for verification — caller can't tell whether the value stuck.
-    private static string FormatReadback( object value )
+    /// <summary>
+    /// Describe why a converted value should not be written, or null when it is fine.
+    /// Value types and successfully-resolved references return null.
+    /// </summary>
+    private static string UnresolvedReason( object converted, Type targetType )
     {
-        return value switch
-        {
-            null => null,
-            ParticleFloat pf => FormatParticleFloat( pf ),
-            ParticleVector3 pv => $"({FormatParticleFloat( pv.X )}, {FormatParticleFloat( pv.Y )}, {FormatParticleFloat( pv.Z )})",
-            _ => value.ToString()
-        };
+        // A null from a reference-typed conversion means the lookup failed. Value
+        // types never arrive null here, so this cannot fire on an int or a Vector3.
+        if ( converted == null )
+            return targetType.IsValueType ? null : "the lookup returned nothing";
+
+        // Model.Load does not return null for a missing .vmdl — it returns the
+        // error model, which renders as a checkerboard and reads as a live asset.
+        if ( converted is Model model && model.IsError )
+            return "the path resolved to the engine's error model";
+
+        if ( converted is Material material && !material.IsValid() )
+            return "the material did not load";
+
+        if ( converted is Texture texture && !texture.IsValid() )
+            return "the texture did not load";
+
+        return null;
     }
 
-    private static string FormatParticleFloat( ParticleFloat pf )
+    /// <summary>
+    /// True when the caller deliberately asked to clear a property — JSON null, or
+    /// the strings "null" / "" that the converters treat as a clear.
+    /// </summary>
+    private static bool IsExplicitNullRequest( JsonElement el )
     {
-        return pf.Type switch
-        {
-            ParticleFloat.ValueType.Constant   => $"Constant({pf.ConstantValue})",
-            ParticleFloat.ValueType.Range      => $"Range({pf.ConstantA},{pf.ConstantB})",
-            ParticleFloat.ValueType.Curve      => "Curve(<not-rendered>)",
-            ParticleFloat.ValueType.CurveRange => "CurveRange(<not-rendered>)",
-            _ => "Unknown"
-        };
-    }
-
-    private static BBox ParseBBox( JsonElement el )
-    {
-        // Accept three string forms:
-        //   "x1,y1,z1;x2,y2,z2"                     — semicolon separates mins from maxs
-        //   "mins x,y,z, maxs x,y,z"                — get_properties readback format
-        //   "x1,y1,z1,x2,y2,z2"                     — six comma-separated floats
-        if ( el.ValueKind == JsonValueKind.String )
-        {
-            var s = el.GetString().Trim();
-
-            // Form 2: parse "mins x,y,z, maxs x,y,z"
-            if ( s.Contains( "mins" ) && s.Contains( "maxs" ) )
-            {
-                var minsIdx = s.IndexOf( "mins", StringComparison.OrdinalIgnoreCase );
-                var maxsIdx = s.IndexOf( "maxs", StringComparison.OrdinalIgnoreCase );
-                var minsPart = s.Substring( minsIdx + 4, maxsIdx - minsIdx - 4 ).Trim().TrimEnd( ',' ).Trim();
-                var maxsPart = s.Substring( maxsIdx + 4 ).Trim();
-                return new BBox(
-                    HandlerBase.ParseVector3( minsPart ),
-                    HandlerBase.ParseVector3( maxsPart ) );
-            }
-
-            // Form 1: "x1,y1,z1;x2,y2,z2"
-            if ( s.Contains( ';' ) )
-            {
-                var halves = s.Split( ';' );
-                if ( halves.Length != 2 )
-                    throw new ArgumentException(
-                        $"BBox semicolon form must be 'x1,y1,z1;x2,y2,z2', got '{s}'." );
-                return new BBox(
-                    HandlerBase.ParseVector3( halves[0] ),
-                    HandlerBase.ParseVector3( halves[1] ) );
-            }
-
-            // Form 3: six comma-separated floats
-            var parts = s.Split( ',' );
-            if ( parts.Length != 6 )
-                throw new ArgumentException(
-                    $"BBox must be 'x1,y1,z1;x2,y2,z2' or six comma-separated floats, got '{s}'." );
-            return new BBox(
-                new Vector3(
-                    float.Parse( parts[0].Trim(), System.Globalization.CultureInfo.InvariantCulture ),
-                    float.Parse( parts[1].Trim(), System.Globalization.CultureInfo.InvariantCulture ),
-                    float.Parse( parts[2].Trim(), System.Globalization.CultureInfo.InvariantCulture ) ),
-                new Vector3(
-                    float.Parse( parts[3].Trim(), System.Globalization.CultureInfo.InvariantCulture ),
-                    float.Parse( parts[4].Trim(), System.Globalization.CultureInfo.InvariantCulture ),
-                    float.Parse( parts[5].Trim(), System.Globalization.CultureInfo.InvariantCulture ) ) );
-        }
-
-        // JSON object: {"Mins": {x,y,z}, "Maxs": {x,y,z}} or with lowercase keys
-        if ( el.ValueKind == JsonValueKind.Object )
-        {
-            Vector3 mins = default, maxs = default;
-            JsonElement mEl;
-            if ( el.TryGetProperty( "Mins", out mEl ) || el.TryGetProperty( "mins", out mEl ) )
-                mins = (Vector3)ConvertJsonValue( mEl, typeof( Vector3 ) );
-            if ( el.TryGetProperty( "Maxs", out mEl ) || el.TryGetProperty( "maxs", out mEl ) )
-                maxs = (Vector3)ConvertJsonValue( mEl, typeof( Vector3 ) );
-            return new BBox( mins, maxs );
-        }
-
-        throw new ArgumentException(
-            $"Cannot convert {el.ValueKind} to BBox. Use a string or {{Mins,Maxs}} object." );
+        if ( el.ValueKind == JsonValueKind.Null ) return true;
+        if ( el.ValueKind != JsonValueKind.String ) return false;
+        var s = el.GetString();
+        return string.IsNullOrEmpty( s ) || s == "null";
     }
 
     /// <summary>
     /// Convert a JSON value to the target CLR type.
     /// Supports: string, bool, int, float, double, Vector3, Enum, Model, Component, GameObject.
+    /// Ported from OzmiumWriteHandlers.ConvertJsonValue.
     /// </summary>
-    private static object ConvertJsonValue( JsonElement el, Type targetType )
+    internal static object ConvertJsonValue( JsonElement el, Type targetType )
     {
         if ( targetType == typeof( string ) )
             return el.ValueKind == JsonValueKind.String ? el.GetString() : el.GetRawText();
@@ -433,6 +341,7 @@ internal static class ComponentHandler
 
         if ( targetType == typeof( Vector2 ) )
         {
+            // Accept "x,y" string or {x,y} / {u,v} object
             if ( el.ValueKind == JsonValueKind.String )
                 return HandlerBase.ParseVector2( el.GetString() );
             if ( el.ValueKind == JsonValueKind.Object )
@@ -448,48 +357,74 @@ internal static class ComponentHandler
 
         if ( targetType == typeof( Rotation ) )
         {
-            // Accept "pitch,yaw,roll" string or {pitch,yaw,roll} object.
-            // Rotation has implicit conversion from Angles, which is constructed
-            // from pitch/yaw/roll in degrees.
             if ( el.ValueKind == JsonValueKind.String )
             {
-                var parts = el.GetString().Split( ',' );
-                if ( parts.Length != 3 )
-                    throw new ArgumentException(
-                        $"Rotation must be 'pitch,yaw,roll', got '{el.GetString()}'." );
-                return Rotation.From(
-                    pitch: float.Parse( parts[0].Trim(),
-                        System.Globalization.CultureInfo.InvariantCulture ),
-                    yaw:   float.Parse( parts[1].Trim(),
-                        System.Globalization.CultureInfo.InvariantCulture ),
-                    roll:  float.Parse( parts[2].Trim(),
-                        System.Globalization.CultureInfo.InvariantCulture ) );
+                var euler = HandlerBase.ParseVector3( el.GetString() );
+                return Rotation.From( euler.x, euler.y, euler.z );
             }
             if ( el.ValueKind == JsonValueKind.Object )
             {
-                float pitch = 0, yaw = 0, roll = 0;
-                if ( el.TryGetProperty( "pitch", out var pp ) ) pitch = pp.GetSingle();
-                if ( el.TryGetProperty( "yaw",   out var yp ) ) yaw   = yp.GetSingle();
-                if ( el.TryGetProperty( "roll",  out var rp ) ) roll  = rp.GetSingle();
+                float pitch = el.TryGetProperty( "pitch", out var p ) ? p.GetSingle() : 0f;
+                float yaw = el.TryGetProperty( "yaw", out var y ) ? y.GetSingle() : 0f;
+                float roll = el.TryGetProperty( "roll", out var r ) ? r.GetSingle() : 0f;
                 return Rotation.From( pitch, yaw, roll );
             }
+        }
+
+        if ( targetType == typeof( Color ) || targetType == typeof( Color32 ) )
+        {
+            if ( el.ValueKind == JsonValueKind.String )
+            {
+                var s = el.GetString();
+                var parts = s.Split( ',', StringSplitOptions.TrimEntries );
+                if ( parts.Length >= 3 )
+                {
+                    float r = float.Parse( parts[0] ) / 255f;
+                    float g = float.Parse( parts[1] ) / 255f;
+                    float b = float.Parse( parts[2] ) / 255f;
+                    float a = parts.Length > 3 ? float.Parse( parts[3] ) / 255f : 1f;
+                    return targetType == typeof( Color32 ) ? (object)new Color32( (byte)(r * 255), (byte)(g * 255), (byte)(b * 255), (byte)(a * 255) ) : new Color( r, g, b, a );
+                }
+                // Fallback to Color.Parse for hex ("#RRGGBB") and named colors.
+                // Color.Parse returns null on anything it cannot read. Coalescing that
+                // to default() turns a typo into transparent black and reports success —
+                // the same silent-no-op class the reference-type guard in SetProperty
+                // covers, except a value type never trips that null check. Refuse here.
+                var parsed = Color.Parse( s );
+                if ( !parsed.HasValue )
+                    throw new ArgumentException(
+                        $"Cannot parse '{s}' as a colour. Use 'r,g,b' or 'r,g,b,a' in 0-255, " +
+                        "a hex string like '#RRGGBB' or '#RRGGBBAA', or a named colour." );
+                return targetType == typeof( Color32 ) ? (object)(Color32)parsed.Value : parsed.Value;
+            }
+            if ( el.ValueKind == JsonValueKind.Object )
+            {
+                float r = el.TryGetProperty( "r", out var rp ) ? rp.GetSingle() : 255f;
+                float g = el.TryGetProperty( "g", out var gp ) ? gp.GetSingle() : 255f;
+                float b = el.TryGetProperty( "b", out var bp ) ? bp.GetSingle() : 255f;
+                float a = el.TryGetProperty( "a", out var ap ) ? ap.GetSingle() : 255f;
+                return targetType == typeof( Color32 ) ? (object)new Color32( (byte)r, (byte)g, (byte)b, (byte)a ) : new Color( r / 255f, g / 255f, b / 255f, a / 255f );
+            }
+        }
+
+        if ( targetType.IsGenericType && targetType.GetGenericTypeDefinition() == typeof( List<> ) && el.ValueKind == JsonValueKind.Array )
+        {
+            var itemType = targetType.GetGenericArguments()[0];
+            var list = (System.Collections.IList)Activator.CreateInstance( targetType );
+            foreach ( var item in el.EnumerateArray() )
+                list.Add( ConvertJsonValue( item, itemType ) );
+            return list;
         }
 
         if ( targetType == typeof( BBox ) )
             return ParseBBox( el );
 
-        if ( targetType == typeof( Color ) )
-        {
-            var str = el.ValueKind == JsonValueKind.String ? el.GetString() : el.GetRawText();
-            return Color.Parse( str ) ?? default;
-        }
-
         // ParticleFloat — wrapper that varies a float per-particle. Modes:
         //   "5"            → Constant mode, value 5
         //   "0.75,2.6"     → Range mode, picks per-particle in [0.75, 2.6]
         //   5  (JSON num)  → Constant mode, value 5
-        //   {Type,Constants,...} (JSON obj) → routed through ParticleFloat.JsonRead
-        //                                     for full Curve / CurveRange coverage
+        //   {Type,ConstantA,...} (JSON obj) → explicit; Curve / CurveRange route
+        //                                     through the engine's own JsonRead
         if ( targetType == typeof( ParticleFloat ) )
             return ParseParticleFloat( el );
 
@@ -499,9 +434,10 @@ internal static class ComponentHandler
         if ( targetType == typeof( ParticleVector3 ) )
             return ParseParticleVector3( el );
 
-        // ParticleGradient — wrapper for Color-over-life. Constant mode only here:
-        //   "r,g,b,a"      → Constant mode, single color
-        //   {Type,ConstantValue,...} (JSON obj) → routed through ParticleGradient.JsonRead
+        // ParticleGradient — wrapper for Color-over-life.
+        //   "r,g,b,a"                    → Constant mode, single color
+        //   "r1,g1,b1,a1;r2,g2,b2,a2"    → Range mode
+        //   {Type,ConstantA,...}         → full control incl. Evaluation
         if ( targetType == typeof( ParticleGradient ) )
             return ParseParticleGradient( el );
 
@@ -519,9 +455,7 @@ internal static class ComponentHandler
             return Model.Load( path );
         }
 
-        // Handle Sandbox.Material — separate from GameResource (Material's base
-        // is Sandbox.Resource, not Sandbox.GameResource). Has its own static Load
-        // with internal cache.
+        // Handle Sandbox.Material from an asset path string (same pattern as Model)
         if ( targetType == typeof( Material ) )
         {
             var path = el.ValueKind == JsonValueKind.String ? el.GetString() : el.GetRawText();
@@ -529,12 +463,20 @@ internal static class ComponentHandler
             return Material.Load( path );
         }
 
+        // Handle Sandbox.Texture from an asset path string
+        if ( targetType == typeof( Texture ) )
+        {
+            var path = el.ValueKind == JsonValueKind.String ? el.GetString() : el.GetRawText();
+            if ( string.IsNullOrEmpty( path ) || path == "null" ) return null;
+            return Texture.Load( path );
+        }
+
         // Generic GameResource — covers Sprite, PrefabFile, ClutterCollection,
-        // TerrainStorage, SoundEvent, and every project-defined GameResource
-        // subclass via ResourceLibrary.Get<T>(path). Reflection-routed so we
-        // don't need a per-type branch for every resource the engine adds.
-        // The post-condition check downstream confirms the load actually
-        // succeeded (returns null + helpful error if asset isn't indexed).
+        // TerrainStorage, SoundEvent and every project-defined GameResource
+        // subclass via ResourceLibrary.Get<T>(path). Reflection-routed so a new
+        // engine resource type does not need its own branch here. Must stay
+        // AFTER the Model / Material / Texture branches — those derive from
+        // Sandbox.Resource, not GameResource, and have their own loaders.
         if ( typeof( GameResource ).IsAssignableFrom( targetType ) )
         {
             var path = el.ValueKind == JsonValueKind.String ? el.GetString() : el.GetRawText();
@@ -553,8 +495,7 @@ internal static class ComponentHandler
                 throw new InvalidOperationException(
                     "ResourceLibrary.Get<T>(string) not found via reflection — engine API may have changed." );
 
-            var generic = getMethod.MakeGenericMethod( targetType );
-            return generic.Invoke( null, new object[] { path } );
+            return getMethod.MakeGenericMethod( targetType ).Invoke( null, new object[] { path } );
         }
 
         // Handle Component references by GUID
@@ -605,38 +546,87 @@ internal static class ComponentHandler
         return Convert.ChangeType( raw, targetType );
     }
 
+    // ── BBox parser ──────────────────────────────────────────────────
+
+    private static BBox ParseBBox( JsonElement el )
+    {
+        // Accept three string forms:
+        //   "x1,y1,z1;x2,y2,z2"        — semicolon separates mins from maxs
+        //   "mins x,y,z, maxs x,y,z"   — the get_properties readback format
+        //   "x1,y1,z1,x2,y2,z2"        — six comma-separated floats
+        if ( el.ValueKind == JsonValueKind.String )
+        {
+            var s = el.GetString().Trim();
+
+            if ( s.Contains( "mins", StringComparison.OrdinalIgnoreCase ) &&
+                 s.Contains( "maxs", StringComparison.OrdinalIgnoreCase ) )
+            {
+                var minsIdx = s.IndexOf( "mins", StringComparison.OrdinalIgnoreCase );
+                var maxsIdx = s.IndexOf( "maxs", StringComparison.OrdinalIgnoreCase );
+                var minsPart = s.Substring( minsIdx + 4, maxsIdx - minsIdx - 4 ).Trim().TrimEnd( ',' ).Trim();
+                var maxsPart = s.Substring( maxsIdx + 4 ).Trim();
+                return new BBox( HandlerBase.ParseVector3( minsPart ), HandlerBase.ParseVector3( maxsPart ) );
+            }
+
+            if ( s.Contains( ';' ) )
+            {
+                var halves = s.Split( ';' );
+                if ( halves.Length != 2 )
+                    throw new ArgumentException( $"BBox semicolon form must be 'x1,y1,z1;x2,y2,z2', got '{s}'." );
+                return new BBox( HandlerBase.ParseVector3( halves[0] ), HandlerBase.ParseVector3( halves[1] ) );
+            }
+
+            var parts = s.Split( ',' );
+            if ( parts.Length != 6 )
+                throw new ArgumentException(
+                    $"BBox must be 'x1,y1,z1;x2,y2,z2' or six comma-separated floats, got '{s}'." );
+            return new BBox(
+                new Vector3( ParseFloat( parts[0] ), ParseFloat( parts[1] ), ParseFloat( parts[2] ) ),
+                new Vector3( ParseFloat( parts[3] ), ParseFloat( parts[4] ), ParseFloat( parts[5] ) ) );
+        }
+
+        // JSON object: {"Mins": {x,y,z}, "Maxs": {x,y,z}} or lowercase keys
+        if ( el.ValueKind == JsonValueKind.Object )
+        {
+            Vector3 mins = default, maxs = default;
+            JsonElement mEl;
+            if ( el.TryGetProperty( "Mins", out mEl ) || el.TryGetProperty( "mins", out mEl ) )
+                mins = (Vector3)ConvertJsonValue( mEl, typeof( Vector3 ) );
+            if ( el.TryGetProperty( "Maxs", out mEl ) || el.TryGetProperty( "maxs", out mEl ) )
+                maxs = (Vector3)ConvertJsonValue( mEl, typeof( Vector3 ) );
+            return new BBox( mins, maxs );
+        }
+
+        throw new ArgumentException( $"Cannot convert {el.ValueKind} to BBox. Use a string or {{Mins,Maxs}} object." );
+    }
+
+    private static float ParseFloat( string s ) =>
+        float.Parse( s.Trim(), System.Globalization.CultureInfo.InvariantCulture );
+
     // ── Particle-wrapper parsers ─────────────────────────────────────
     //
-    // Why these exist: ParticleFloat / ParticleVector3 / ParticleGradient
-    // are struct wrappers used on every particle field (Lifetime, Rate, Scale,
-    // Velocity, Alpha, Tint-over-life, ...). They store a constant, a range,
-    // a curve, or a curve-range. Convert.ChangeType has no path from string to
-    // these types, so set_property previously errored with "Invalid cast from
-    // System.String to Sandbox.ParticleFloat" on the most-tuned fields in the
-    // particle system. We handle Constant + Range from short string syntax
-    // (the common 95% of tuning), and route JSON objects through each type's
-    // own JsonRead static method so every mode (Curve / CurveRange / etc.) is
-    // supported without re-implementing the curve serialization here.
+    // ParticleFloat / ParticleVector3 / ParticleGradient are struct wrappers
+    // used on every particle field (Lifetime, Rate, Scale, Velocity, Alpha,
+    // Tint-over-life, ...). They hold a constant, a range, a curve, or a
+    // curve-range. Convert.ChangeType has no path from string to these types,
+    // so before this existed set_property failed with "Invalid cast from
+    // System.String to Sandbox.ParticleFloat" on exactly the most-tuned fields
+    // in the particle system. Constant + Range come from short string syntax
+    // (the common case); Curve / CurveRange route through the engine's own
+    // JsonRead so curve serialization is not re-implemented here.
 
     private static ParticleFloat ParseParticleFloat( JsonElement el )
     {
-        // Number JSON value: 5 → Constant.
         if ( el.ValueKind == JsonValueKind.Number )
-        {
-            var pf = new ParticleFloat();
-            pf.Type = ParticleFloat.ValueType.Constant;
-            pf.ConstantValue = el.GetSingle();
-            return pf;
-        }
+            return ConstantParticleFloat( el.GetSingle() );
 
         if ( el.ValueKind == JsonValueKind.String )
         {
             var str = el.GetString().Trim();
 
-            // MCP's `value` parameter is always a string — when callers pass JSON
-            // (`{"Type":"Range","ConstantA":4,...}`) it arrives here as a String
-            // wrapping that JSON text, not as a JsonValueKind.Object. Detect the
-            // JSON-object shape and re-parse so the object branch below fires.
+            // The MCP `value` parameter is always a string, so a caller passing
+            // JSON ({"Type":"Range",...}) arrives here as a String wrapping that
+            // text rather than as JsonValueKind.Object. Detect and re-parse.
             if ( str.StartsWith( "{" ) )
             {
                 using var doc = JsonDocument.Parse( str );
@@ -646,43 +636,29 @@ internal static class ComponentHandler
             var parts = str.Split( ',' );
 
             if ( parts.Length == 1 )
-            {
-                var v = float.Parse( parts[0].Trim(),
-                    System.Globalization.CultureInfo.InvariantCulture );
-                var pf = new ParticleFloat();
-                pf.Type = ParticleFloat.ValueType.Constant;
-                pf.ConstantValue = v;
-                return pf;
-            }
+                return ConstantParticleFloat( ParseFloat( parts[0] ) );
 
             if ( parts.Length == 2 )
             {
-                var a = float.Parse( parts[0].Trim(),
-                    System.Globalization.CultureInfo.InvariantCulture );
-                var b = float.Parse( parts[1].Trim(),
-                    System.Globalization.CultureInfo.InvariantCulture );
-                // Two-arg ctor sets Range mode. Setting Type explicitly anyway
-                // to be robust against any future ctor refactor.
-                var pf = new ParticleFloat( a, b );
+                // Two-arg ctor sets Range mode; Type is set explicitly anyway to
+                // stay correct if that ctor is ever refactored.
+                var pf = new ParticleFloat( ParseFloat( parts[0] ), ParseFloat( parts[1] ) );
                 pf.Type = ParticleFloat.ValueType.Range;
                 return pf;
             }
 
-            throw new ArgumentException(
-                $"ParticleFloat string must be 'value' or 'min,max', got '{str}'." );
+            throw new ArgumentException( $"ParticleFloat string must be 'value' or 'min,max', got '{str}'." );
         }
 
         if ( el.ValueKind == JsonValueKind.Object )
         {
-            // Explicit property parsing — covers Constant + Range modes plus
-            // Evaluation control (Life / Frame / Seed / Particle). Bypasses
-            // ParticleFloat.JsonRead which uses an unknown internal schema and
-            // empirically returned zeros for ConstantA/ConstantB even when
-            // those fields were set in the input JSON.
-            //
-            // Curve / CurveRange modes still need the engine's deserializer
-            // (their CurveA/CurveB Curve structs are non-trivial to construct
-            // by hand) — they fall through to JsonRead.
+            // Explicit property parsing covers Constant + Range plus the
+            // Evaluation control (Life / Frame / Seed / Particle). This bypasses
+            // ParticleFloat.JsonRead, whose internal schema is undocumented and
+            // which upstream measured returning zeros for ConstantA/ConstantB
+            // even when the input JSON set them. Curve / CurveRange still need
+            // the engine deserializer — their CurveA/CurveB structs are not
+            // reasonable to build by hand — so those fall through to it.
             if ( el.TryGetProperty( "Type", out var typeEl ) )
             {
                 var typeStr = typeEl.GetString();
@@ -691,17 +667,17 @@ internal static class ComponentHandler
                     return DeserializeParticleFloatJson( el.GetRawText() );
             }
 
-            var pf = new ParticleFloat();
+            var result = new ParticleFloat();
             if ( el.TryGetProperty( "Type", out var t ) )
-                pf.Type = (ParticleFloat.ValueType)Enum.Parse(
+                result.Type = (ParticleFloat.ValueType)Enum.Parse(
                     typeof( ParticleFloat.ValueType ), t.GetString(), ignoreCase: true );
             if ( el.TryGetProperty( "Evaluation", out var ev ) )
-                pf.Evaluation = (ParticleFloat.EvaluationType)Enum.Parse(
+                result.Evaluation = (ParticleFloat.EvaluationType)Enum.Parse(
                     typeof( ParticleFloat.EvaluationType ), ev.GetString(), ignoreCase: true );
-            if ( el.TryGetProperty( "ConstantValue", out var cv ) ) pf.ConstantValue = cv.GetSingle();
-            if ( el.TryGetProperty( "ConstantA",     out var ca ) ) pf.ConstantA     = ca.GetSingle();
-            if ( el.TryGetProperty( "ConstantB",     out var cb ) ) pf.ConstantB     = cb.GetSingle();
-            return pf;
+            if ( el.TryGetProperty( "ConstantValue", out var cv ) ) result.ConstantValue = cv.GetSingle();
+            if ( el.TryGetProperty( "ConstantA", out var ca ) ) result.ConstantA = ca.GetSingle();
+            if ( el.TryGetProperty( "ConstantB", out var cb ) ) result.ConstantB = cb.GetSingle();
+            return result;
         }
 
         throw new ArgumentException(
@@ -714,21 +690,25 @@ internal static class ComponentHandler
         var bytes = System.Text.Encoding.UTF8.GetBytes( json );
         var reader = new System.Text.Json.Utf8JsonReader( bytes );
         reader.Read();   // advance to the first token (StartObject)
-        // Utf8JsonReader is a ref struct → pass by ref. JsonRead(reader, type)
-        // is documented without a ref qualifier in arenula-api but the
-        // underlying ref struct constraint forces ref-passing at the call site.
+        // JsonRead is documented without a ref qualifier, but Utf8JsonReader is
+        // a ref struct, so the call site must pass it by ref.
         return (ParticleFloat)ParticleFloat.JsonRead( ref reader, typeof( ParticleFloat ) );
+    }
+
+    private static ParticleFloat ConstantParticleFloat( float v )
+    {
+        var pf = new ParticleFloat();
+        pf.Type = ParticleFloat.ValueType.Constant;
+        pf.ConstantValue = v;
+        return pf;
     }
 
     private static ParticleVector3 ParseParticleVector3( JsonElement el )
     {
-        // String "x,y,z" → constant per-axis (most common case).
         if ( el.ValueKind == JsonValueKind.String )
         {
             var str = el.GetString().Trim();
 
-            // Same reason as ParseParticleFloat: MCP value param is always a
-            // string, so a JSON-object input arrives wrapped. Detect and reparse.
             if ( str.StartsWith( "{" ) )
             {
                 using var doc = JsonDocument.Parse( str );
@@ -738,15 +718,12 @@ internal static class ComponentHandler
             var parts = str.Split( ',' );
             if ( parts.Length != 3 )
                 throw new ArgumentException(
-                    $"ParticleVector3 string must be 'x,y,z' or '{{X,Y,Z}}' JSON object, got '{str}'." );
+                    $"ParticleVector3 string must be 'x,y,z' or a {{X,Y,Z}} JSON object, got '{str}'." );
 
             var pv = new ParticleVector3();
-            pv.X = ConstantParticleFloat( float.Parse( parts[0].Trim(),
-                System.Globalization.CultureInfo.InvariantCulture ) );
-            pv.Y = ConstantParticleFloat( float.Parse( parts[1].Trim(),
-                System.Globalization.CultureInfo.InvariantCulture ) );
-            pv.Z = ConstantParticleFloat( float.Parse( parts[2].Trim(),
-                System.Globalization.CultureInfo.InvariantCulture ) );
+            pv.X = ConstantParticleFloat( ParseFloat( parts[0] ) );
+            pv.Y = ConstantParticleFloat( ParseFloat( parts[1] ) );
+            pv.Z = ConstantParticleFloat( ParseFloat( parts[2] ) );
             return pv;
         }
 
@@ -761,16 +738,7 @@ internal static class ComponentHandler
         }
 
         throw new ArgumentException(
-            $"Cannot convert {el.ValueKind} to ParticleVector3. " +
-            "Use 'x,y,z' string or {X,Y,Z} object." );
-    }
-
-    private static ParticleFloat ConstantParticleFloat( float v )
-    {
-        var pf = new ParticleFloat();
-        pf.Type = ParticleFloat.ValueType.Constant;
-        pf.ConstantValue = v;
-        return pf;
+            $"Cannot convert {el.ValueKind} to ParticleVector3. Use an 'x,y,z' string or {{X,Y,Z}} object." );
     }
 
     private static ParticleGradient ParseParticleGradient( JsonElement el )
@@ -779,43 +747,39 @@ internal static class ComponentHandler
         {
             var s = el.GetString().Trim();
 
-            // JSON-object form passed as string (same pattern as PF/PV3).
             if ( s.StartsWith( "{" ) )
             {
                 using var doc = JsonDocument.Parse( s );
                 return ParseParticleGradient( doc.RootElement );
             }
 
-            // Range form: "r1,g1,b1,a1;r2,g2,b2,a2" — picks per-particle
-            // (or per-frame, or over-life depending on Evaluation).
+            // Range form: "r1,g1,b1,a1;r2,g2,b2,a2" — picks per-particle, or
+            // per-frame, or over life, depending on Evaluation.
             if ( s.Contains( ';' ) )
             {
                 var halves = s.Split( ';' );
                 if ( halves.Length != 2 )
                     throw new ArgumentException(
                         $"ParticleGradient Range form must be 'r1,g1,b1,a1;r2,g2,b2,a2', got '{s}'." );
-                var ca = Color.Parse( halves[0].Trim() ) ?? default;
-                var cb = Color.Parse( halves[1].Trim() ) ?? default;
                 var pgr = new ParticleGradient();
                 pgr.Type = ParticleGradient.ValueType.Range;
-                pgr.ConstantA = ca;
-                pgr.ConstantB = cb;
+                pgr.ConstantA = Color.Parse( halves[0].Trim() ) ?? default;
+                pgr.ConstantB = Color.Parse( halves[1].Trim() ) ?? default;
                 return pgr;
             }
 
             // Constant form: "r,g,b,a" or "#hex".
-            var color = Color.Parse( s ) ?? default;
             var pg = new ParticleGradient();
             pg.Type = ParticleGradient.ValueType.Constant;
-            pg.ConstantValue = color;
+            pg.ConstantValue = Color.Parse( s ) ?? default;
             return pg;
         }
 
         if ( el.ValueKind == JsonValueKind.Object )
         {
             // Full control: {Type, Evaluation, ConstantA, ConstantB, ConstantValue}.
-            // Lets caller specify Range mode + Life/Particle/Frame evaluation
-            // (e.g. fire color cooling over particle life via Range+Life).
+            // This is how you get fire colour cooling over particle life —
+            // Range mode plus Life evaluation.
             var pg = new ParticleGradient();
             if ( el.TryGetProperty( "Type", out var t ) )
                 pg.Type = (ParticleGradient.ValueType)Enum.Parse(
@@ -835,14 +799,16 @@ internal static class ComponentHandler
         throw new ArgumentException(
             $"Cannot convert {el.ValueKind} to ParticleGradient. Use one of: " +
             "'r,g,b,a' (Constant), 'r1,g1,b1,a1;r2,g2,b2,a2' (Range), " +
-            "or {Type,ConstantA,ConstantB,Evaluation} JSON object." );
+            "or a {Type,ConstantA,ConstantB,Evaluation} JSON object." );
     }
 
     // ── set_enabled ──────────────────────────────────────────────────
 
     private static object SetEnabled( JsonElement args )
     {
-        var scene = HandlerBase.RequireScene( "set_enabled" );
+        var scene = SceneHelpers.ResolveScene();
+        if ( scene == null )
+            return HandlerBase.Error( "No active scene.", "set_enabled" );
 
         var id = HandlerBase.GetString( args, "id" );
         if ( string.IsNullOrEmpty( id ) )
@@ -875,7 +841,9 @@ internal static class ComponentHandler
 
     private static object GetProperties( JsonElement args )
     {
-        var scene = HandlerBase.RequireScene( "get_properties" );
+        var scene = SceneHelpers.ResolveScene();
+        if ( scene == null )
+            return HandlerBase.Error( "No active scene.", "get_properties" );
 
         var id = HandlerBase.GetString( args, "id" );
         if ( string.IsNullOrEmpty( id ) )
@@ -898,22 +866,7 @@ internal static class ComponentHandler
             object val;
             try
             {
-                var raw = prop.GetValue( comp );
-                val = raw switch
-                {
-                    null => null,
-                    bool b => (object)b,
-                    int i => (object)i,
-                    float f => (object)MathF.Round( f, 4 ),
-                    double d => (object)Math.Round( d, 4 ),
-                    string s => (object)s,
-                    Enum e => (object)e.ToString(),
-                    Vector3 v => (object)HandlerBase.V3( v ),
-                    Rotation r => (object)HandlerBase.Rot( r ),
-                    ParticleFloat pf => (object)FormatParticleFloat( pf ),
-                    ParticleVector3 pv => (object)$"({FormatParticleFloat( pv.X )}, {FormatParticleFloat( pv.Y )}, {FormatParticleFloat( pv.Z )})",
-                    _ => (object)raw.ToString()
-                };
+                val = SchemaHelpers.FormatValue( prop.GetValue( comp ) );
             }
             catch
             {
@@ -923,9 +876,10 @@ internal static class ComponentHandler
             props.Add( new
             {
                 name = prop.Name,
-                type = prop.PropertyType.Name,
+                type = SchemaHelpers.FormatTypeName( prop.PropertyType ),
                 value = val,
-                canWrite = prop.CanWrite
+                canWrite = prop.CanWrite,
+                schema = SchemaHelpers.DescribeType( prop.PropertyType )
             } );
         }
 
@@ -933,8 +887,10 @@ internal static class ComponentHandler
         {
             gameObjectId = go.Id.ToString(),
             gameObjectName = go.Name,
+            handle = SceneHelpers.BuildHandle( go ),
             componentId = comp.Id.ToString(),
             componentType = comp.GetType().Name,
+            componentHandle = SceneHelpers.BuildHandle( comp ),
             enabled = comp.Enabled,
             properties = props
         } );
@@ -979,7 +935,9 @@ internal static class ComponentHandler
 
     private static object Copy( JsonElement args )
     {
-        var scene = HandlerBase.RequireScene( "copy" );
+        var scene = SceneHelpers.ResolveScene();
+        if ( scene == null )
+            return HandlerBase.Error( "No active scene.", "copy" );
 
         var sourceComponentId = HandlerBase.GetString( args, "source_component_id" );
         if ( string.IsNullOrEmpty( sourceComponentId ) )
@@ -1021,6 +979,103 @@ internal static class ComponentHandler
             target_name = targetGo.Name,
             new_component_id = newComp.Id.ToString(),
             message = $"Copied '{sourceComp.GetType().Name}' from '{sourceComp.GameObject.Name}' to '{targetGo.Name}'."
+        } );
+    }
+
+    // ── bulk_set ─────────────────────────────────────────────────────
+
+    private static object BulkSet( JsonElement args, string action )
+    {
+        var scene = SceneHelpers.ResolveScene();
+        if ( scene == null )
+            return HandlerBase.Error( "No active scene.", action );
+
+        var id = HandlerBase.GetString( args, "id" );
+        if ( string.IsNullOrEmpty( id ) )
+            return HandlerBase.Error( "Missing required 'id' parameter.", action );
+
+        var componentId = HandlerBase.GetString( args, "component_id" );
+        if ( string.IsNullOrEmpty( componentId ) )
+            return HandlerBase.Error( "Missing required 'component_id' parameter.", action );
+
+        if ( !args.TryGetProperty( "properties", out var propsEl ) )
+            return HandlerBase.Error( "Missing required 'properties' parameter. Provide an object or JSON string of {property: value} pairs.", action );
+
+        var go = SceneHelpers.FindByIdOrThrow( scene, id, action );
+        var comp = FindComponentByIdOrThrow( go, componentId, action );
+
+        JsonElement propsObj;
+        if ( propsEl.ValueKind == JsonValueKind.String )
+        {
+            var propsJson = propsEl.GetString();
+            if ( string.IsNullOrEmpty( propsJson ) )
+                return HandlerBase.Error( "Missing required 'properties' parameter. Provide an object or JSON string of {property: value} pairs.", action );
+
+            try
+            {
+                using var doc = JsonDocument.Parse( propsJson );
+                propsObj = doc.RootElement.Clone();
+            }
+            catch ( JsonException ex )
+            {
+                return HandlerBase.Error( $"Failed to parse 'properties' JSON: {ex.Message}", action );
+            }
+        }
+        else
+        {
+            propsObj = propsEl.Clone();
+        }
+
+        if ( propsObj.ValueKind != JsonValueKind.Object )
+            return HandlerBase.Error( "'properties' must be a JSON object, e.g. {\"Model\": \"path.vmdl\", \"Tint\": \"1,0,0,1\"}.", action );
+
+        var setResults = new List<object>();
+        var errors = new List<object>();
+
+        foreach ( var kvp in propsObj.EnumerateObject() )
+        {
+            var propName = kvp.Name;
+            var valEl = kvp.Value;
+
+            var prop = comp.GetType().GetProperty( propName,
+                System.Reflection.BindingFlags.Public | System.Reflection.BindingFlags.Instance );
+
+            if ( prop == null )
+            {
+                errors.Add( new { property = propName, error = $"Property '{propName}' not found on '{comp.GetType().Name}'." } );
+                continue;
+            }
+
+            if ( !prop.CanWrite )
+            {
+                errors.Add( new { property = propName, error = $"Property '{propName}' is read-only." } );
+                continue;
+            }
+
+            try
+            {
+                object converted = ConvertJsonValue( valEl, prop.PropertyType );
+                prop.SetValue( comp, converted );
+                var readback = prop.GetValue( comp );
+                setResults.Add( new { property = propName, value = readback?.ToString() } );
+            }
+            catch ( Exception ex )
+            {
+                errors.Add( new { property = propName, error = ex.Message } );
+            }
+        }
+
+        return HandlerBase.Success( new
+        {
+            id = go.Id.ToString(),
+            name = go.Name,
+            component_id = comp.Id.ToString(),
+            component_type = comp.GetType().Name,
+            set_count = setResults.Count,
+            error_count = errors.Count,
+            set = setResults,
+            errors,
+            message = $"Set {setResults.Count} properties on '{comp.GetType().Name}', {errors.Count} errors."
         } );
     }
 }

@@ -13,6 +13,7 @@ namespace Arenula;
 /// Consolidates Ozmium AddCollider + AddPlaneCollider + AddHullCollider
 /// into a single 'add_collider' action with type param.
 /// CreateJoint moved here from EffectToolHandlers.
+/// Ported from PhysicsToolHandlers.cs (483 lines) + EffectToolHandlers.CreateJoint.
 /// </summary>
 internal static class PhysicsHandler
 {
@@ -43,7 +44,9 @@ internal static class PhysicsHandler
 
     private static object AddCollider( JsonElement args )
     {
-        var scene = HandlerBase.RequireScene( "add_collider" );
+        var scene = SceneHelpers.ResolveScene();
+        if ( scene == null )
+            return HandlerBase.Error( "No active scene.", "add_collider" );
 
         var id = HandlerBase.GetString( args, "id" );
         if ( string.IsNullOrEmpty( id ) )
@@ -75,7 +78,8 @@ internal static class PhysicsHandler
                 var c = go.Components.Create<SphereCollider>();
                 var centerStr = HandlerBase.GetString( args, "center" );
                 if ( centerStr != null ) c.Center = HandlerBase.ParseVector3( centerStr );
-                if ( HandlerBase.TryGetFloat( args, "radius", out var rad ) ) c.Radius = rad;
+                if ( args.TryGetProperty( "radius", out var radEl ) && radEl.ValueKind == JsonValueKind.Number )
+                    c.Radius = radEl.GetSingle();
                 ApplyCommonColliderProps( c, args );
                 return HandlerBase.Success( new
                 {
@@ -91,7 +95,8 @@ internal static class PhysicsHandler
                 if ( startStr != null ) c.Start = HandlerBase.ParseVector3( startStr );
                 var endStr = HandlerBase.GetString( args, "end" );
                 if ( endStr != null ) c.End = HandlerBase.ParseVector3( endStr );
-                if ( HandlerBase.TryGetFloat( args, "radius", out var rad ) ) c.Radius = rad;
+                if ( args.TryGetProperty( "radius", out var radEl ) && radEl.ValueKind == JsonValueKind.Number )
+                    c.Radius = radEl.GetSingle();
                 ApplyCommonColliderProps( c, args );
                 return HandlerBase.Success( new
                 {
@@ -134,7 +139,8 @@ internal static class PhysicsHandler
             {
                 var c = go.Components.Create<HullCollider>();
                 var hullType = HandlerBase.GetString( args, "hull_type", "Box" );
-                c.Type = HandlerBase.RequireEnum<HullCollider.PrimitiveType>( hullType, "hull_type", "create_hull_collider" );
+                if ( Enum.TryParse<HullCollider.PrimitiveType>( hullType, true, out var pt ) )
+                    c.Type = pt;
                 var centerStr = HandlerBase.GetString( args, "center" );
                 if ( centerStr != null ) c.Center = HandlerBase.ParseVector3( centerStr );
                 if ( c.Type == HullCollider.PrimitiveType.Box )
@@ -144,13 +150,17 @@ internal static class PhysicsHandler
                 }
                 else
                 {
-                    if ( HandlerBase.TryGetFloat( args, "height", out var h ) ) c.Height = h;
-                    if ( HandlerBase.TryGetFloat( args, "radius", out var r ) ) c.Radius = r;
+                    if ( args.TryGetProperty( "height", out var hEl ) && hEl.ValueKind == JsonValueKind.Number )
+                        c.Height = hEl.GetSingle();
+                    if ( args.TryGetProperty( "radius", out var rEl ) && rEl.ValueKind == JsonValueKind.Number )
+                        c.Radius = rEl.GetSingle();
                     if ( c.Type == HullCollider.PrimitiveType.Cone )
                     {
-                        if ( HandlerBase.TryGetFloat( args, "tip_radius", out var tr ) ) c.Radius2 = tr;
+                        if ( args.TryGetProperty( "tip_radius", out var trEl ) && trEl.ValueKind == JsonValueKind.Number )
+                            c.Radius2 = trEl.GetSingle();
                     }
-                    if ( HandlerBase.TryGetInt( args, "slices", out var sl ) ) c.Slices = sl;
+                    if ( args.TryGetProperty( "slices", out var slEl ) && slEl.ValueKind == JsonValueKind.Number )
+                        c.Slices = slEl.GetInt32();
                 }
                 ApplyCommonColliderProps( c, args );
                 return HandlerBase.Success( new
@@ -169,32 +179,40 @@ internal static class PhysicsHandler
 
     private static void ApplyCommonColliderProps( Collider collider, JsonElement args )
     {
-        if ( HandlerBase.TryGetBool( args, "is_trigger", out var trig ) ) collider.IsTrigger = trig;
+        if ( args.TryGetProperty( "is_trigger", out var trigEl ) &&
+             ( trigEl.ValueKind == JsonValueKind.True || trigEl.ValueKind == JsonValueKind.False ) )
+            collider.IsTrigger = trigEl.GetBoolean();
 
         var surfaceStr = HandlerBase.GetString( args, "surface" );
         if ( !string.IsNullOrEmpty( surfaceStr ) )
         {
             // Surface is set via the Surface property (resource path)
-            var surfProp = collider.GetType().GetProperty( "Surface" );
-            if ( surfProp != null )
+            try
             {
-                var surface = ResourceLibrary.Get<Surface>( surfaceStr );
-                if ( surface == null )
-                    throw new InvalidOperationException(
-                        $"Surface not found at '{surfaceStr}'. Surface resources must be indexed — user-created .surface assets must live under 'Assets/'." );
-                surfProp.SetValue( collider, surface );
+                var surfProp = collider.GetType().GetProperty( "Surface" );
+                if ( surfProp != null )
+                {
+                    var surface = ResourceLibrary.Get<Surface>( surfaceStr );
+                    if ( surface != null ) surfProp.SetValue( collider, surface );
+                }
             }
+            catch { }
         }
 
-        if ( HandlerBase.TryGetFloat( args, "friction", out var fr ) ) collider.Friction = fr;
-        if ( HandlerBase.TryGetFloat( args, "elasticity", out var el ) ) collider.Elasticity = el;
+        if ( args.TryGetProperty( "friction", out var frEl ) && frEl.ValueKind == JsonValueKind.Number )
+            collider.Friction = frEl.GetSingle();
+        if ( args.TryGetProperty( "elasticity", out var elEl ) && elEl.ValueKind == JsonValueKind.Number )
+            collider.Elasticity = elEl.GetSingle();
     }
 
     // ── configure_collider ────────────────────────────────────────────
+    // Ported from PhysicsToolHandlers.ConfigureCollider
 
     private static object ConfigureCollider( JsonElement args )
     {
-        var scene = HandlerBase.RequireScene( "configure_collider" );
+        var scene = SceneHelpers.ResolveScene();
+        if ( scene == null )
+            return HandlerBase.Error( "No active scene.", "configure_collider" );
 
         var id = HandlerBase.GetString( args, "id" );
         if ( string.IsNullOrEmpty( id ) )
@@ -232,7 +250,8 @@ internal static class PhysicsHandler
         {
             var centerStr = HandlerBase.GetString( args, "center" );
             if ( centerStr != null ) sc.Center = HandlerBase.ParseVector3( centerStr );
-            if ( HandlerBase.TryGetFloat( args, "radius", out var r ) ) sc.Radius = r;
+            if ( args.TryGetProperty( "radius", out var rEl ) && rEl.ValueKind == JsonValueKind.Number )
+                sc.Radius = rEl.GetSingle();
         }
 
         // CapsuleCollider-specific
@@ -242,7 +261,8 @@ internal static class PhysicsHandler
             if ( startStr != null ) cc.Start = HandlerBase.ParseVector3( startStr );
             var endStr = HandlerBase.GetString( args, "end" );
             if ( endStr != null ) cc.End = HandlerBase.ParseVector3( endStr );
-            if ( HandlerBase.TryGetFloat( args, "radius", out var cr ) ) cc.Radius = cr;
+            if ( args.TryGetProperty( "radius", out var crEl ) && crEl.ValueKind == JsonValueKind.Number )
+                cc.Radius = crEl.GetSingle();
         }
 
         // Common properties
@@ -252,10 +272,13 @@ internal static class PhysicsHandler
     }
 
     // ── add_rigidbody ─────────────────────────────────────────────────
+    // Ported from PhysicsToolHandlers.AddRigidbody
 
     private static object AddRigidbody( JsonElement args )
     {
-        var scene = HandlerBase.RequireScene( "add_rigidbody" );
+        var scene = SceneHelpers.ResolveScene();
+        if ( scene == null )
+            return HandlerBase.Error( "No active scene.", "add_rigidbody" );
 
         var id = HandlerBase.GetString( args, "id" );
         if ( string.IsNullOrEmpty( id ) )
@@ -264,12 +287,18 @@ internal static class PhysicsHandler
         var go = SceneHelpers.FindByIdOrThrow( scene, id, "add_rigidbody" );
 
         var rb = go.Components.Create<Rigidbody>();
-        if ( HandlerBase.TryGetFloat( args, "mass", out var mass ) ) rb.MassOverride = mass;
-        if ( HandlerBase.TryGetFloat( args, "linear_damping", out var ld ) ) rb.LinearDamping = ld;
-        if ( HandlerBase.TryGetFloat( args, "angular_damping", out var ad ) ) rb.AngularDamping = ad;
+        if ( args.TryGetProperty( "mass", out var massEl ) && massEl.ValueKind == JsonValueKind.Number )
+            rb.MassOverride = massEl.GetSingle();
+        if ( args.TryGetProperty( "linear_damping", out var ldEl ) && ldEl.ValueKind == JsonValueKind.Number )
+            rb.LinearDamping = ldEl.GetSingle();
+        if ( args.TryGetProperty( "angular_damping", out var adEl ) && adEl.ValueKind == JsonValueKind.Number )
+            rb.AngularDamping = adEl.GetSingle();
         rb.Gravity = HandlerBase.GetBool( args, "gravity", true );
-        if ( HandlerBase.TryGetFloat( args, "gravity_scale", out var gs ) ) rb.GravityScale = gs;
-        if ( HandlerBase.TryGetBool( args, "enhanced_ccd", out var ccd ) ) rb.EnhancedCcd = ccd;
+        if ( args.TryGetProperty( "gravity_scale", out var gsEl ) && gsEl.ValueKind == JsonValueKind.Number )
+            rb.GravityScale = gsEl.GetSingle();
+        if ( args.TryGetProperty( "enhanced_ccd", out var ccdEl ) &&
+             ( ccdEl.ValueKind == JsonValueKind.True || ccdEl.ValueKind == JsonValueKind.False ) )
+            rb.EnhancedCcd = ccdEl.GetBoolean();
 
         return HandlerBase.Success( new
         {
@@ -282,10 +311,13 @@ internal static class PhysicsHandler
     }
 
     // ── create_model_physics ──────────────────────────────────────────
+    // Ported from PhysicsToolHandlers.CreateModelPhysics
 
     private static object CreateModelPhysics( JsonElement args )
     {
-        var scene = HandlerBase.RequireScene( "create_model_physics" );
+        var scene = SceneHelpers.ResolveScene();
+        if ( scene == null )
+            return HandlerBase.Error( "No active scene.", "create_model_physics" );
 
         // This action can work on an existing GO (via id) or create a new one
         var id = HandlerBase.GetString( args, "id" );
@@ -307,7 +339,10 @@ internal static class PhysicsHandler
 
         var modelPath = HandlerBase.GetString( args, "model_path" );
         if ( !string.IsNullOrEmpty( modelPath ) )
-            mp.Model = HandlerBase.RequireModel( modelPath, "create_map_physics" );
+        {
+            var model = Model.Load( modelPath );
+            if ( model != null ) mp.Model = model;
+        }
 
         mp.MotionEnabled = HandlerBase.GetBool( args, "motion_enabled", true );
 
@@ -321,10 +356,13 @@ internal static class PhysicsHandler
     }
 
     // ── create_character_controller ───────────────────────────────────
+    // Ported from PhysicsToolHandlers.CreateCharacterController
 
     private static object CreateCharacterController( JsonElement args )
     {
-        var scene = HandlerBase.RequireScene( "create_character_controller" );
+        var scene = SceneHelpers.ResolveScene();
+        if ( scene == null )
+            return HandlerBase.Error( "No active scene.", "create_character_controller" );
 
         // This action can work on existing GO (via id) or create a new one
         var id = HandlerBase.GetString( args, "id" );
@@ -343,12 +381,18 @@ internal static class PhysicsHandler
         }
 
         var cc = go.Components.Create<CharacterController>();
-        if ( HandlerBase.TryGetFloat( args, "radius", out var r ) ) cc.Radius = r;
-        if ( HandlerBase.TryGetFloat( args, "height", out var h ) ) cc.Height = h;
-        if ( HandlerBase.TryGetFloat( args, "step_height", out var sh ) ) cc.StepHeight = sh;
-        if ( HandlerBase.TryGetFloat( args, "ground_angle", out var ga ) ) cc.GroundAngle = ga;
-        if ( HandlerBase.TryGetFloat( args, "acceleration", out var ac ) ) cc.Acceleration = ac;
-        if ( HandlerBase.TryGetFloat( args, "bounciness", out var bn ) ) cc.Bounciness = bn;
+        if ( args.TryGetProperty( "radius", out var rEl ) && rEl.ValueKind == JsonValueKind.Number )
+            cc.Radius = rEl.GetSingle();
+        if ( args.TryGetProperty( "height", out var hEl ) && hEl.ValueKind == JsonValueKind.Number )
+            cc.Height = hEl.GetSingle();
+        if ( args.TryGetProperty( "step_height", out var shEl ) && shEl.ValueKind == JsonValueKind.Number )
+            cc.StepHeight = shEl.GetSingle();
+        if ( args.TryGetProperty( "ground_angle", out var gaEl ) && gaEl.ValueKind == JsonValueKind.Number )
+            cc.GroundAngle = gaEl.GetSingle();
+        if ( args.TryGetProperty( "acceleration", out var acEl ) && acEl.ValueKind == JsonValueKind.Number )
+            cc.Acceleration = acEl.GetSingle();
+        if ( args.TryGetProperty( "bounciness", out var bnEl ) && bnEl.ValueKind == JsonValueKind.Number )
+            cc.Bounciness = bnEl.GetSingle();
 
         return HandlerBase.Success( new
         {
@@ -365,7 +409,9 @@ internal static class PhysicsHandler
 
     private static object CreateJoint( JsonElement args )
     {
-        var scene = HandlerBase.RequireScene( "create_joint" );
+        var scene = SceneHelpers.ResolveScene();
+        if ( scene == null )
+            return HandlerBase.Error( "No active scene.", "create_joint" );
 
         var type = HandlerBase.GetString( args, "type", "fixed" );
         var bodyA = HandlerBase.GetString( args, "body_a" );
@@ -379,25 +425,18 @@ internal static class PhysicsHandler
 
         Joint joint = type.ToLowerInvariant() switch
         {
-            "ball"    => go.Components.Create<BallJoint>(),
-            "hinge"   => go.Components.Create<HingeJoint>(),
-            "slider"  => go.Components.Create<SliderJoint>(),
-            "spring"  => go.Components.Create<SpringJoint>(),
-            "wheel"   => go.Components.Create<WheelJoint>(),
-            "upright" => go.Components.Create<UprightJoint>(),
-            _         => go.Components.Create<FixedJoint>()
+            "ball"   => go.Components.Create<BallJoint>(),
+            "hinge"  => go.Components.Create<HingeJoint>(),
+            "slider" => go.Components.Create<SliderJoint>(),
+            "spring" => go.Components.Create<SpringJoint>(),
+            "wheel"  => go.Components.Create<WheelJoint>(),
+            _        => go.Components.Create<FixedJoint>()
         };
 
-        if ( HandlerBase.TryGetFloat( args, "break_force", out var bf ) ) joint.BreakForce = bf;
-        if ( HandlerBase.TryGetFloat( args, "break_torque", out var bt ) ) joint.BreakTorque = bt;
-
-        // UprightJoint-specific properties
-        if ( joint is UprightJoint uj )
-        {
-            if ( HandlerBase.TryGetFloat( args, "hertz", out var hz ) ) uj.Hertz = hz;
-            if ( HandlerBase.TryGetFloat( args, "damping_ratio", out var dr ) ) uj.DampingRatio = dr;
-            if ( HandlerBase.TryGetFloat( args, "max_torque", out var mt ) ) uj.MaxTorque = mt;
-        }
+        if ( args.TryGetProperty( "break_force", out var bfEl ) && bfEl.ValueKind == JsonValueKind.Number )
+            joint.BreakForce = bfEl.GetSingle();
+        if ( args.TryGetProperty( "break_torque", out var btEl ) && btEl.ValueKind == JsonValueKind.Number )
+            joint.BreakTorque = btEl.GetSingle();
 
         // Link body_a
         var bodyAGo = SceneHelpers.FindByIdOrThrow( scene, bodyA, "create_joint" );
@@ -405,7 +444,11 @@ internal static class PhysicsHandler
 
         // Link body_b (optional anchor body)
         var bodyB = HandlerBase.GetString( args, "body_b" );
-        joint.AnchorBody = HandlerBase.ResolveGameObjectById( scene, bodyB, "create_joint" );
+        if ( !string.IsNullOrEmpty( bodyB ) )
+        {
+            var bodyBGo = SceneHelpers.FindById( scene, bodyB );
+            if ( bodyBGo != null ) joint.AnchorBody = bodyBGo;
+        }
 
         return HandlerBase.Success( new
         {

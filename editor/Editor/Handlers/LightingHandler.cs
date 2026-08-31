@@ -12,6 +12,7 @@ namespace Arenula;
 /// lighting tool: create, configure, create_skybox, set_skybox.
 /// Consolidates Ozmium CreateLight + CreateAmbientLight + CreateIndirectLightVolume
 /// into a single 'create' action with type param.
+/// Ported from LightingToolHandlers.cs (480 lines).
 /// </summary>
 internal static class LightingHandler
 {
@@ -40,7 +41,9 @@ internal static class LightingHandler
 
     private static object Create( JsonElement args )
     {
-        var scene = HandlerBase.RequireScene( "create" );
+        var scene = SceneHelpers.ResolveScene();
+        if ( scene == null )
+            return HandlerBase.Error( "No active scene.", "create" );
 
         var type = HandlerBase.GetString( args, "type", "point" );
         var posStr = HandlerBase.GetString( args, "position" );
@@ -134,17 +137,25 @@ internal static class LightingHandler
         // Type-specific properties
         if ( light is PointLight pl )
         {
-            if ( HandlerBase.TryGetFloat( args, "range", out var range ) ) pl.Radius = range;
-            else if ( HandlerBase.TryGetFloat( args, "radius", out var rad ) ) pl.Radius = rad;
-            if ( HandlerBase.TryGetFloat( args, "attenuation", out var att ) ) pl.Attenuation = att;
+            if ( args.TryGetProperty( "range", out var rangeEl ) && rangeEl.ValueKind == JsonValueKind.Number )
+                pl.Radius = rangeEl.GetSingle();
+            else if ( args.TryGetProperty( "radius", out var radEl ) && radEl.ValueKind == JsonValueKind.Number )
+                pl.Radius = radEl.GetSingle();
+            if ( args.TryGetProperty( "attenuation", out var attEl ) && attEl.ValueKind == JsonValueKind.Number )
+                pl.Attenuation = attEl.GetSingle();
         }
         else if ( light is SpotLight sl )
         {
-            if ( HandlerBase.TryGetFloat( args, "range", out var range ) ) sl.Radius = range;
-            else if ( HandlerBase.TryGetFloat( args, "radius", out var rad ) ) sl.Radius = rad;
-            if ( HandlerBase.TryGetFloat( args, "attenuation", out var att ) ) sl.Attenuation = att;
-            if ( HandlerBase.TryGetFloat( args, "cone_outer", out var co ) ) sl.ConeOuter = co;
-            if ( HandlerBase.TryGetFloat( args, "cone_inner", out var ci ) ) sl.ConeInner = ci;
+            if ( args.TryGetProperty( "range", out var rangeEl ) && rangeEl.ValueKind == JsonValueKind.Number )
+                sl.Radius = rangeEl.GetSingle();
+            else if ( args.TryGetProperty( "radius", out var radEl ) && radEl.ValueKind == JsonValueKind.Number )
+                sl.Radius = radEl.GetSingle();
+            if ( args.TryGetProperty( "attenuation", out var attEl ) && attEl.ValueKind == JsonValueKind.Number )
+                sl.Attenuation = attEl.GetSingle();
+            if ( args.TryGetProperty( "cone_outer", out var coEl ) && coEl.ValueKind == JsonValueKind.Number )
+                sl.ConeOuter = coEl.GetSingle();
+            if ( args.TryGetProperty( "cone_inner", out var ciEl ) && ciEl.ValueKind == JsonValueKind.Number )
+                sl.ConeInner = ciEl.GetSingle();
         }
 
         return HandlerBase.Success( new
@@ -158,7 +169,9 @@ internal static class LightingHandler
 
     private static object CreateAmbient( Scene scene, JsonElement args, Vector3 position )
     {
-        var go = SceneHelpers.CreateChildObject( scene, args, "Ambient Light", position );
+        var go = scene.CreateObject();
+        go.Name = HandlerBase.GetString( args, "name" ) ?? "Ambient Light";
+        go.WorldPosition = position;
 
         var amb = go.Components.Create<AmbientLight>();
         var colorStr = HandlerBase.GetString( args, "color", "Gray" );
@@ -209,7 +222,8 @@ internal static class LightingHandler
         var sky = scene.CreateObject();
         sky.Name = "Sky Box";
         var skyComp = sky.Components.Create<SkyBox2D>();
-        skyComp.SkyMaterial = HandlerBase.RequireMaterial( skyMat, "create_light" );
+        var mat = Material.Load( skyMat );
+        if ( mat != null ) skyComp.SkyMaterial = mat;
         skyComp.SkyIndirectLighting = true;
 
         return HandlerBase.Success( new
@@ -223,7 +237,9 @@ internal static class LightingHandler
 
     private static object CreateIndirectVolume( Scene scene, JsonElement args, Vector3 position )
     {
-        var go = SceneHelpers.CreateChildObject( scene, args, "Indirect Light Volume", position );
+        var go = scene.CreateObject();
+        go.Name = HandlerBase.GetString( args, "name" ) ?? "Indirect Light Volume";
+        go.WorldPosition = position;
 
         var ilg = go.Components.Create<IndirectLightVolume>();
 
@@ -235,9 +251,12 @@ internal static class LightingHandler
             ilg.Bounds = BBox.FromPositionAndSize( 0, sv );
         }
 
-        if ( HandlerBase.TryGetInt( args, "probe_density", out var pd ) ) ilg.ProbeDensity = pd;
-        if ( HandlerBase.TryGetFloat( args, "normal_bias", out var nb ) ) ilg.NormalBias = nb;
-        if ( HandlerBase.TryGetFloat( args, "contrast", out var ct ) ) ilg.Contrast = ct;
+        if ( args.TryGetProperty( "probe_density", out var pdEl ) && pdEl.ValueKind == JsonValueKind.Number )
+            ilg.ProbeDensity = pdEl.GetInt32();
+        if ( args.TryGetProperty( "normal_bias", out var nbEl ) && nbEl.ValueKind == JsonValueKind.Number )
+            ilg.NormalBias = nbEl.GetSingle();
+        if ( args.TryGetProperty( "contrast", out var ctEl ) && ctEl.ValueKind == JsonValueKind.Number )
+            ilg.Contrast = ctEl.GetSingle();
 
         var igbStr = HandlerBase.GetString( args, "inside_geometry_behavior" );
         if ( igbStr != null && Enum.TryParse<InsideGeometryBehaviorType>( igbStr, true, out var igb ) )
@@ -258,17 +277,20 @@ internal static class LightingHandler
     }
 
     // ── configure ─────────────────────────────────────────────────────────
+    // Ported from LightingToolHandlers.ConfigureLight
 
     private static object Configure( JsonElement args )
     {
-        var scene = HandlerBase.RequireScene( "configure" );
+        var scene = SceneHelpers.ResolveScene();
+        if ( scene == null )
+            return HandlerBase.Error( "No active scene.", "configure" );
 
         var id = HandlerBase.GetString( args, "id" );
         if ( string.IsNullOrEmpty( id ) )
             return HandlerBase.Error( "Missing required 'id' parameter.", "configure" );
 
         var go = SceneHelpers.FindByIdOrThrow( scene, id, "configure" );
-        var light = SceneHelpers.GetComponentByIdOrFirst<Light>( go, args );
+        var light = go.Components.GetAll().FirstOrDefault( c => c is Light ) as Light;
         if ( light == null )
             return HandlerBase.Error( $"No Light component found on '{go.Name}'.", "configure" );
 
@@ -347,21 +369,29 @@ internal static class LightingHandler
     }
 
     // ── create_skybox ──────────────────────────────────────────────────────
+    // Ported from LightingToolHandlers.CreateSkyBox
 
     private static object CreateSkybox( JsonElement args )
     {
-        var scene = HandlerBase.RequireScene( "create_skybox" );
+        var scene = SceneHelpers.ResolveScene();
+        if ( scene == null )
+            return HandlerBase.Error( "No active scene.", "create_skybox" );
 
         var posStr = HandlerBase.GetString( args, "position" );
         var position = posStr != null ? HandlerBase.ParseVector3( posStr ) : Vector3.Zero;
         var skyMaterial = HandlerBase.GetString( args, "material", "materials/skybox/skybox_day_01.vmat" );
 
-        var go = SceneHelpers.CreateChildObject( scene, args, "Sky Box", position );
+        var go = scene.CreateObject();
+        go.Name = HandlerBase.GetString( args, "name" ) ?? "Sky Box";
+        go.WorldPosition = position;
 
         var sky = go.Components.Create<SkyBox2D>();
 
         if ( !string.IsNullOrEmpty( skyMaterial ) )
-            sky.SkyMaterial = HandlerBase.RequireMaterial( skyMaterial, "configure_skybox" );
+        {
+            var mat = Material.Load( skyMaterial );
+            if ( mat != null ) sky.SkyMaterial = mat;
+        }
 
         var tintStr = HandlerBase.GetString( args, "tint" );
         if ( !string.IsNullOrEmpty( tintStr ) )
@@ -385,17 +415,20 @@ internal static class LightingHandler
     }
 
     // ── set_skybox ─────────────────────────────────────────────────────────
+    // Ported from LightingToolHandlers.SetSkyBox
 
     private static object SetSkybox( JsonElement args )
     {
-        var scene = HandlerBase.RequireScene( "set_skybox" );
+        var scene = SceneHelpers.ResolveScene();
+        if ( scene == null )
+            return HandlerBase.Error( "No active scene.", "set_skybox" );
 
         SkyBox2D sky = null;
         var id = HandlerBase.GetString( args, "id" );
         if ( !string.IsNullOrEmpty( id ) )
         {
             var go = SceneHelpers.FindByIdOrThrow( scene, id, "set_skybox" );
-            sky = SceneHelpers.GetComponentByIdOrFirst<SkyBox2D>( go, args );
+            sky = go.Components.GetAll().FirstOrDefault( c => c is SkyBox2D ) as SkyBox2D;
             if ( sky == null )
                 return HandlerBase.Error( $"No SkyBox2D component found on '{go.Name}'.", "set_skybox" );
         }
@@ -413,7 +446,10 @@ internal static class LightingHandler
 
         var matStr = HandlerBase.GetString( args, "material" );
         if ( !string.IsNullOrEmpty( matStr ) )
-            sky.SkyMaterial = HandlerBase.RequireMaterial( matStr, "set_ambient_sky" );
+        {
+            var mat = Material.Load( matStr );
+            if ( mat != null ) sky.SkyMaterial = mat;
+        }
 
         var tintStr = HandlerBase.GetString( args, "tint" );
         if ( !string.IsNullOrEmpty( tintStr ) )
